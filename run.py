@@ -158,7 +158,7 @@ def get_data_loaders(path, dataset_class, batch_size, valid_ratio, num_workers, 
 
     return train_loader, valid_loader, test_loader , train_sampler
 
-def main(local_rank, seeds):
+def training(local_rank, seeds):
     
     print(f"Running main(**args) on rank {local_rank}.")
     init_ddp(local_rank) 
@@ -434,7 +434,13 @@ def main(local_rank, seeds):
         print("=" * 100)
 
 
-    dist.destroy_process_group()
+def main(local_rank, seeds):
+    try:
+        training(local_rank, seeds)
+    finally:
+        # Release NCCL resources on normal completion and on Python exceptions.
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":
