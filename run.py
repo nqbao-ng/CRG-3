@@ -342,7 +342,7 @@ def training(local_rank, seeds):
                     checkpoint = {
                         'model_state_dict': model.module.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
-                        'args': args.copy(),
+                        'args': vars(args).copy(),
                         'valid_f1': best_valid_f1,
                         'test_f1_at_best_dev_epoch': test_f1_emo,
                         'test_acc_at_best_dev_epoch': test_acc_emo,
