@@ -342,7 +342,7 @@ def main(local_rank, seeds):
                     checkpoint = {
                         'model_state_dict': model.module.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
-                        'args': args,
+                        'args': args.copy(),
                         'valid_f1': best_valid_f1,
                         'test_f1_at_best_dev_epoch': test_f1_emo,
                         'test_acc_at_best_dev_epoch': test_acc_emo,
@@ -377,7 +377,7 @@ def main(local_rank, seeds):
         if args.tensorboard:
             writer.close()
         if local_rank == 0:
-            checkpoint = torch.load(save_path, map_location=f"cuda:{local_rank}")
+            checkpoint = torch.load(save_path, map_location=f"cuda:{local_rank}", weights_only=False)
             model.module.load_state_dict(checkpoint['model_state_dict'])
 
             test_loss, test_label_emo, test_pred_emo, test_acc_emo, test_f1_emo, _, test_initial_feats, test_extracted_feats = train_or_eval_model(
