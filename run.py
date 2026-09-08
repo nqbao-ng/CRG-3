@@ -20,7 +20,7 @@ from dataloader import (
     MELDDataset_BERT,
     CMUMOSEIDataset7
 )
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tensorboardX import SummaryWriter
 import argparse
 from plot import plot_tsne, plot_confusion_matrix
@@ -105,32 +105,39 @@ def init_ddp(local_rank):
         raise
 
 
-def get_train_valid_sampler(trainset, valid_ratio):
-    size = len(trainset)
-    idx = list(range(size))
-    split = int(valid_ratio * size)
+def get_data_loaders(path, dataset_class, batch_size, valid_ratio, num_workers, pin_memory, sampler_seed=2026):
+    full_trainset = dataset_class(path, train=True)
+    
+    size = len(full_trainset)
+    indices = list(range(size))
 
-    return DistributedSampler(idx[split:]), DistributedSampler(idx[:split])
+    split = max(1, int(valid_ratio * size))
+    valid_indices = indices[:split]
+    train_indices = indices[split:]
 
+    train_subset = Subset(full_trainset, train_indices)
+    valid_subset = Subset(full_trainset, valid_indices)
 
-def get_data_loaders(path, dataset_class, batch_size, valid_ratio, num_workers, pin_memory):
-    trainset = dataset_class(path)
-    train_sampler, valid_sampler = get_train_valid_sampler(trainset, valid_ratio)
+    train_sampler = DistributedSampler(
+        train_subset,
+        shuffle=True,
+        seed=sampler_seed
+    )
 
     train_loader = DataLoader(
-        trainset,
+        train_subset,
         batch_size=batch_size,
         sampler=train_sampler,
-        collate_fn=trainset.collate_fn,
+        collate_fn=full_trainset.collate_fn,
         num_workers=num_workers,
         pin_memory=pin_memory
     )
 
     valid_loader = DataLoader(
-        trainset,
+        valid_subset,
         batch_size=batch_size,
-        sampler=valid_sampler,
-        collate_fn=trainset.collate_fn,
+        shuffle=False,
+        collate_fn=full_trainset.collate_fn,
         num_workers=num_workers,
         pin_memory=pin_memory
     )
@@ -139,25 +146,23 @@ def get_data_loaders(path, dataset_class, batch_size, valid_ratio, num_workers, 
     test_loader = DataLoader(
         testset,
         batch_size=batch_size,
+        shuffle=False,
         collate_fn=testset.collate_fn,
         num_workers=num_workers,
         pin_memory=pin_memory
     )
 
-    return train_loader, valid_loader, test_loader
+    train_ids = [full_trainset.keys[i] for i in train_indices]
+    valid_ids = [full_trainset.keys[i] for i in valid_indices]
+    assert set(train_ids).isdisjoint(valid_ids)
 
-
-def setup_samplers(trainset, valid_ratio, epoch):
-    train_sampler, valid_sampler = get_train_valid_sampler(
-        trainset, valid_ratio=valid_ratio)
-    train_sampler.set_epoch(epoch)
-    valid_sampler.set_epoch(epoch)
-
+    return train_loader, valid_loader, test_loader , train_sampler
 
 def main(local_rank, seeds):
     
     print(f"Running main(**args) on rank {local_rank}.")
     init_ddp(local_rank) 
+    seed_test_accs, seed_test_f1s = [], []
     for seed in seeds:
         args.seed = seed
 
@@ -216,52 +221,51 @@ def main(local_rank, seeds):
             optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.l2, amsgrad=True)
 
         if args.dataset == "MELD":
-            train_loader, valid_loader, test_loader = get_data_loaders(
+            train_loader, valid_loader, test_loader, train_sampler = get_data_loaders(
                 path=MELD_path,
                 dataset_class=MELDDataset_BERT,
                 valid_ratio=0.1,
                 batch_size=args.batch_size,
                 num_workers=0,
-                pin_memory=False
+                pin_memory=False,
+                sampler_seed=args.seed
             )
         elif args.dataset == "IEMOCAP":
-            train_loader, valid_loader, test_loader = get_data_loaders(
+            train_loader, valid_loader, test_loader, train_sampler = get_data_loaders(
                 path=IEMOCAP_path,
                 dataset_class=IEMOCAPDataset_BERT,
                 valid_ratio=0.1,
                 batch_size=args.batch_size,
                 num_workers=0,
-                pin_memory=False
+                pin_memory=False,
+                sampler_seed=args.seed
             )
         
         elif args.dataset == "CMUMOSEI7":
-            train_loader, valid_loader, test_loader = get_data_loaders(
+            train_loader, valid_loader, test_loader, train_sampler = get_data_loaders(
                 path=CMUMOSEI7_path,
                 dataset_class=CMUMOSEIDataset7,
                 valid_ratio=0.1,
                 batch_size=args.batch_size,
                 num_workers=0,
-                pin_memory=False
+                pin_memory=False,
+                sampler_seed=args.seed
             )
 
         else:
             print("There is no such dataset")
 
-        best_f1_emo, best_loss = None, None
-        best_label_emo, best_pred_emo = None, None
-        best_initial_feats = None
-        best_extracted_feats = None
-        all_f1_emo, all_acc_emo, all_loss = [], [], []
+        best_valid_f1 = -float("inf")
+        best_epoch = -1
+        save_dir = "checkpoints"
+        if local_rank == 0:
+            os.makedirs(save_dir, exist_ok=True)
+
+        save_path = os.path.join(save_dir, f"best_model_{args.dataset}_{args.seed}.pth")
 
         for epoch in range(args.epochs):
-            if args.dataset == "MELD":
-                trainset = MELDDataset_BERT(MELD_path)
-            elif args.dataset == "IEMOCAP":
-                trainset = IEMOCAPDataset_BERT(IEMOCAP_path)
-            elif args.dataset == "CMUMOSEI7":
-                trainset = CMUMOSEIDataset7(CMUMOSEI7_path)
 
-            setup_samplers(trainset, valid_ratio=0.1, epoch=epoch)
+            train_sampler.set_epoch(epoch)
 
             start_time = time.time()
 
@@ -280,36 +284,23 @@ def main(local_rank, seeds):
                 awl,
                 args.seed
             )
-
-            valid_loss, _, _, valid_acc_emo, valid_f1_emo, _, _, _ = train_or_eval_model(
-                model,
-                loss_function_emo,
-                loss_function_kl,
-                valid_loader,
-                cuda,
-                args.modals,
-                None,
-                False,
-                args.loss_type,
-                args.gammas,
-                args.temp,
-                awl,
-                args.seed
-            )
-
-            print(
-                "epoch: {}, train_loss: {}, train_acc_emo: {}, train_f1_emo: {}, valid_loss: {}, valid_acc_emo: {}, valid_f1_emo: {}"
-                .format(
-                    epoch + 1,
-                    train_loss,
-                    train_acc_emo,
-                    train_f1_emo,
-                    valid_loss,
-                    valid_acc_emo,
-                    valid_f1_emo
-                ))
-
             if local_rank == 0:
+                valid_loss, valid_label_emo, valid_pred_emo, valid_acc_emo, valid_f1_emo, _, _, _ = train_or_eval_model(
+                    model,
+                    loss_function_emo,
+                    loss_function_kl,
+                    valid_loader,
+                    cuda,
+                    args.modals,
+                    None,
+                    False,
+                    args.loss_type,
+                    args.gammas,
+                    args.temp,
+                    awl,
+                    args.seed
+                )
+
                 test_loss, test_label_emo, test_pred_emo, test_acc_emo, test_f1_emo, _, test_initial_feats, test_extracted_feats = train_or_eval_model(
                     model,
                     loss_function_emo,
@@ -326,57 +317,55 @@ def main(local_rank, seeds):
                     args.seed
                 )
 
-                all_f1_emo.append(test_f1_emo)
-                all_acc_emo.append(test_acc_emo)
-
                 print(
-                    "test_loss: {}, test_acc_emo: {}, test_f1_emo: {}, total time: {} sec, {}"
+                    "epoch: {}, train_loss: {}, train_acc_emo: {}, train_f1_emo: {}, valid_loss: {}, valid_acc_emo: {}, valid_f1_emo: {}, "
+                    "test_loss: {}, test_acc_emo: {}, test_f1_emo: {}, total time: {} sec"
                     .format(
+                        epoch + 1,
+                        train_loss,
+                        train_acc_emo,
+                        train_f1_emo,
+                        valid_loss,
+                        valid_acc_emo,
+                        valid_f1_emo,
                         test_loss,
                         test_acc_emo,
                         test_f1_emo,
                         round(time.time() - start_time, 2),
                         time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
                     ))
-                print("-" * 100)
                 
-                if best_f1_emo == None or best_f1_emo < test_f1_emo:
-                    best_f1_emo = test_f1_emo
-                    best_label_emo, best_pred_emo = test_label_emo, test_pred_emo
-                    best_initial_feats = test_initial_feats
-                    best_extracted_feats = test_extracted_feats
-
-                    # save checkpoints
-                    save_dir = "checkpoints"
-                    if not os.path.exists(save_dir):
-                        os.makedirs(save_dir)
-
-                    save_path = os.path.join(save_dir, f"best_model_{args.dataset}_{args.seed}.pth")
+                if valid_f1_emo > best_valid_f1:
+                    best_valid_f1 = valid_f1_emo
+                    best_epoch = epoch + 1
 
                     checkpoint = {
                         'model_state_dict': model.module.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
                         'args': args,
-                        'f1': best_f1_emo,
-                        'epoch': epoch + 1 
+                        'valid_f1': best_valid_f1,
+                        'test_f1_at_best_dev_epoch': test_f1_emo,
+                        'test_acc_at_best_dev_epoch': test_acc_emo,
+                        'epoch': best_epoch
                     }
-
                     torch.save(checkpoint, save_path)
 
 
                 if (epoch + 1) % 10 == 0:
                     np.set_printoptions(suppress=True)
-                    print(classification_report(best_label_emo, best_pred_emo, digits=4, zero_division=0))
-                    print(confusion_matrix(best_label_emo, best_pred_emo))
+                    print(classification_report(valid_label_emo, valid_pred_emo, digits=4, zero_division=0))
+                    print(confusion_matrix(valid_label_emo, valid_pred_emo))
                     print("-" * 100)
 
-            dist.barrier()
+                if args.tensorboard:
+                    writer.add_scalar("valid: accuracy", valid_acc_emo, epoch)
+                    writer.add_scalar("valid: fscore", valid_f1_emo, epoch)
+                    writer.add_scalar("test: accuracy", test_acc_emo, epoch)
+                    writer.add_scalar("test: fscore", test_f1_emo, epoch)
+                    writer.add_scalar("train: accuracy", train_acc_emo, epoch)
+                    writer.add_scalar("train: fscore", train_f1_emo, epoch)
 
-            if args.tensorboard:
-                writer.add_scalar("test: accuracy", test_acc_emo, epoch)
-                writer.add_scalar("test: fscore", test_f1_emo, epoch)
-                writer.add_scalar("train: accuracy", train_acc_emo, epoch)
-                writer.add_scalar("train: fscore", train_f1_emo, epoch)
+            dist.barrier()
 
             if epoch == 1:
                 allocated_memory = torch.cuda.memory_allocated()
@@ -388,27 +377,61 @@ def main(local_rank, seeds):
         if args.tensorboard:
             writer.close()
         if local_rank == 0:
-            print("Test performance..")
-            print("Acc: {}, F-Score: {}".format(max(all_acc_emo), max(all_f1_emo)))
+            checkpoint = torch.load(save_path, map_location=f"cuda:{local_rank}")
+            model.module.load_state_dict(checkpoint['model_state_dict'])
+
+            test_loss, test_label_emo, test_pred_emo, test_acc_emo, test_f1_emo, _, test_initial_feats, test_extracted_feats = train_or_eval_model(
+                model.module,
+                loss_function_emo,
+                loss_function_kl,
+                test_loader,
+                cuda,
+                args.modals,
+                None,
+                False,
+                args.loss_type,
+                args.gammas,
+                args.temp,
+                awl,
+                args.seed
+            )
+
+            print("-" * 100)
+            print(
+                f"Best dev checkpoint: epoch {best_epoch}, dev WF1={best_valid_f1:.2f}"
+            )
+            print(
+                f"FINAL TEST (best-dev checkpoint): loss={test_loss}, "
+                f"Acc={test_acc_emo:.2f}, WF1={test_f1_emo:.2f}"
+            )
+            print(classification_report(test_label_emo, test_pred_emo, digits=4, zero_division=0))
+            print(confusion_matrix(test_label_emo, test_pred_emo))
+
+            seed_test_accs.append(test_acc_emo)
+            seed_test_f1s.append(test_f1_emo)
 
             log_path = "results/log_results.txt"
             os.makedirs("results", exist_ok=True)
-
-            report_str = classification_report(best_label_emo,
-                                    best_pred_emo,
-                                    digits=4,
-                                    zero_division=0)
-
             with open(log_path, "a") as f:
-                f.write(f"Seed: {args.seed}  Acc: {max(all_acc_emo):.4f}   F-Score: {max(all_f1_emo):.4f}\n")
-                # f.write(report_str + "\n")
+                f.write(
+                    f"Seed: {args.seed}  BestEpoch: {best_epoch}  "
+                    f"DevF1: {best_valid_f1:.4f}  "
+                    f"TestAcc: {test_acc_emo:.4f}  TestF1: {test_f1_emo:.4f}\n"
+                )
 
-            print(report_str)
-            # conf_matrix = confusion_matrix(best_label_emo, best_pred_emo)
-            # print(conf_matrix)
-            # plot_confusion_matrix(conf_matrix, args.dataset, f'conf_{args.seed}')
-            plot_tsne(best_initial_feats, best_label_emo, args.dataset, f'initial_features_{args.seed}')
-            plot_tsne(best_extracted_feats, best_label_emo, args.dataset, f'extracted_features_{args.seed}')
+            plot_tsne(test_initial_feats, test_label_emo, args.dataset, f'initial_features_{args.seed}')
+            plot_tsne(test_extracted_feats, test_label_emo, args.dataset, f'extracted_features_{args.seed}')
+
+        dist.barrier()
+    
+    if local_rank == 0 and seed_test_f1s:
+        print("=" * 100)
+        print(
+            f"FINAL over {len(seed_test_f1s)} seeds | "
+            f"Test Acc: {np.mean(seed_test_accs):.2f} ± {np.std(seed_test_accs):.2f} | "
+            f"Test WF1: {np.mean(seed_test_f1s):.2f} ± {np.std(seed_test_f1s):.2f}"
+        )
+        print("=" * 100)
 
 
     dist.destroy_process_group()
@@ -420,7 +443,5 @@ if __name__ == "__main__":
     print("not args.no_cuda:", not args.no_cuda)
     n_gpus = torch.cuda.device_count()
     print(f"Use {n_gpus} GPUs")
-    seeds = [260, 9161, 1833, 3216, 3620, 6083, 4642, 2931, 5973, 2136]
+    seeds = [260, 9161, 1833, 3216, 3620]
     mp.spawn(fn=main, args=(seeds,), nprocs=n_gpus)
-
-            
