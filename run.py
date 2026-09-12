@@ -68,6 +68,15 @@ parser.add_argument("--temp", type=float, default=1.0, help="temp of KL loss")
 
 parser.add_argument("--seed", type=int, default=2020, help="seed")
 
+parser.add_argument("--reasoning_token", choices=["learned", "text"], default="learned",
+                    help="Summary token initialization; only used with --fusion_method reasoning")
+parser.add_argument("--reasoning_heads", type=int, default=8,
+                    help="Attention heads in reasoning; must divide hidden_dim")
+parser.add_argument("--reasoning_dropout", type=float, default=None,
+                    help="Reasoning dropout; defaults to dropout_2")
+parser.add_argument("--reasoning_no_gate", action="store_true",
+                    help="Disable feature-wise evidence gating inside reasoning")
+
 parser.add_argument("--no_intra", action="store_true", default=False, help="does not use Trans based contextual modeling")
 
 parser.add_argument("--fusion_method", default="gated", help="fusion method: gated/concat/add/mean/max")
@@ -438,7 +447,6 @@ def main(local_rank, seeds):
     try:
         training(local_rank, seeds)
     finally:
-        # Release NCCL resources on normal completion and on Python exceptions.
         if dist.is_initialized():
             dist.destroy_process_group()
 
@@ -449,5 +457,6 @@ if __name__ == "__main__":
     print("not args.no_cuda:", not args.no_cuda)
     n_gpus = torch.cuda.device_count()
     print(f"Use {n_gpus} GPUs")
-    seeds = [260, 9161, 1833, 3216, 3620]
+    #seeds = [260, 9161, 1833, 3216, 3620]
+    seeds = args.seeds
     mp.spawn(fn=main, args=(seeds,), nprocs=n_gpus)

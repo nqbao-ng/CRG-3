@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from module import TransformerBasedContext, GatedFusion, CrossModalGraph
 from utils import flatten_batch
-
+from reasoning import ReasoningFusion
 
 class DiGemo(nn.Module):
 
@@ -86,6 +86,19 @@ class DiGemo(nn.Module):
         self.v_cls_layer = nn.Linear(args.hidden_dim, n_classes_emo)
         self.a_cls_layer = nn.Linear(args.hidden_dim, n_classes_emo)
         self.fusion_cls_layer = nn.Linear(args.hidden_dim, n_classes_emo)
+
+        if self.fusion_method == 'reasoning':
+            reasoning_dropout = getattr(args, 'reasoning_dropout', None)
+            if reasoning_dropout is None:
+                reasoning_dropout = args.dropout_2
+            self.reasoning_fusion = ReasoningFusion(
+                hidden_dim=args.hidden_dim,
+                num_heads=getattr(args, 'reasoning_heads', 8),
+                dropout=reasoning_dropout,
+                token_mode=getattr(args, 'reasoning_token', 'learned'),
+                modals=self.modals,
+                use_gate=not getattr(args, 'reasoning_no_gate', False),
+            )
         
 
     def forward(self, feature_t, feature_v, feature_a, umask, qmask, dia_lengths):
@@ -206,6 +219,11 @@ class DiGemo(nn.Module):
 
         if self.fusion_method == 'gated':
             fused_feature = self.gated_fusion(h_list)
+        elif self.fusion_method == 'reasoning':
+            # Stage: graph + residual -> reasoning -> fusion classifier.
+            # feature_t is still the contextual text feature BEFORE graph.
+            query = feature_t if self.reasoning_fusion.token_mode == 'text' else None
+            fused_feature = self.reasoning_fusion(h_list, query=query)
         elif self.fusion_method == 'mean':
             fused_feature = torch.sum(torch.stack(h_list), dim=0) / len(h_list)
         elif self.fusion_method == 'concat':
