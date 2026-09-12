@@ -457,6 +457,6 @@ if __name__ == "__main__":
     print("not args.no_cuda:", not args.no_cuda)
     n_gpus = torch.cuda.device_count()
     print(f"Use {n_gpus} GPUs")
-    #seeds = [260, 9161, 1833, 3216, 3620]
-    seeds = args.seeds
+    seeds = [260, 9161, 1833, 3216, 3620]
+    #seeds = args.seeds
     mp.spawn(fn=main, args=(seeds,), nprocs=n_gpus)
