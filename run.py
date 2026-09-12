@@ -66,7 +66,13 @@ parser.add_argument("--num_heads", type=int, default=8, metavar="H", help="numbe
 
 parser.add_argument("--temp", type=float, default=1.0, help="temp of KL loss")
 
-parser.add_argument("--seed", type=int, default=2020, help="seed")
+parser.add_argument(
+    "--seeds",
+    nargs="+",
+    type=int,
+    default=[260, 9161, 1833, 3216, 3620],
+    help="Danh sach seed dung de huan luyen"
+)
 
 parser.add_argument("--reasoning_token", choices=["learned", "text"], default="learned",
                     help="Summary token initialization; only used with --fusion_method reasoning")
@@ -457,6 +463,6 @@ if __name__ == "__main__":
     print("not args.no_cuda:", not args.no_cuda)
     n_gpus = torch.cuda.device_count()
     print(f"Use {n_gpus} GPUs")
-    seeds = [260, 9161, 1833, 3216, 3620]
-    #seeds = args.seeds
+    #seeds = [260, 9161, 1833, 3216, 3620]
+    seeds = args.seeds
     mp.spawn(fn=main, args=(seeds,), nprocs=n_gpus)
