@@ -1,7 +1,7 @@
 """Mamba with fused CUDA selective scan and an equivalent CPU/reference path.
 
 CUDA requires mamba_ssm: fail explicitly rather than silently use the high-memory path.
-Weights, projections, convolution, recurrence and modality experts remain unchanged.
+Projection, convolution and recurrence are shared by both RMSNorm ablations.
 """
 import math
 
@@ -29,44 +29,19 @@ class RMSNorm(nn.Module):
         return (xf * self.weight.float()).to(x.dtype)
 
 
-class ExpertLinear(nn.Module):
-    """Deterministic modality-aware projection: shared expert + expert of the token's modality.
-
-    Both experts run in parallel and are summed; routing is fixed by the modality id (no router).
-    """
-
-    def __init__(self, in_dim, out_dim, num_modalities=3, bias=False):
-        super().__init__()
-        self.shared = nn.Linear(in_dim, out_dim, bias=bias)
-        self.specific = nn.ModuleList([nn.Linear(in_dim, out_dim, bias=bias) for _ in range(num_modalities)])
-
-    def forward(self, x, modality_ids):
-        # x: [..., L, in_dim], modality_ids: [..., L]
-        all_specific = torch.stack([expert(x) for expert in self.specific], dim=-2)   # [...,L,M,out]
-        route = F.one_hot(modality_ids, len(self.specific)).to(all_specific.dtype)[..., None]
-        return self.shared(x) + (all_specific * route).sum(-2)
-
-
 class MambaMixer(nn.Module):
     """in_proj -> causal depthwise conv -> SiLU -> selective SSM, gated by SiLU(z) -> out_proj.
-
-    With `num_modalities > 0`, in_proj/out_proj become ExpertLinear (Modality-Aware Mamba);
-    conv and SSM core stay shared.
     """
 
-    def __init__(self, d_model, d_state=16, d_conv=4, expand=2, num_modalities=0,
+    def __init__(self, d_model, d_state=16, d_conv=4, expand=2,
                  dt_min=1e-3, dt_max=1e-1, dt_init_floor=1e-4):
         super().__init__()
         d_inner = expand * d_model
         self.d_inner, self.d_state = d_inner, d_state
         self.scan_backend = "auto"  # reference is only for CPU checks/parity tests
         self.dt_rank = math.ceil(d_model / 16)
-        if num_modalities:
-            self.in_proj = ExpertLinear(d_model, 2 * d_inner, num_modalities)
-            self.out_proj = ExpertLinear(d_inner, d_model, num_modalities)
-        else:
-            self.in_proj = nn.Linear(d_model, 2 * d_inner, bias=False)
-            self.out_proj = nn.Linear(d_inner, d_model, bias=False)
+        self.in_proj = nn.Linear(d_model, 2 * d_inner, bias=False)
+        self.out_proj = nn.Linear(d_inner, d_model, bias=False)
         self.conv1d = nn.Conv1d(d_inner, d_inner, d_conv, groups=d_inner, padding=d_conv - 1)
         self.x_proj = nn.Linear(d_inner, self.dt_rank + 2 * d_state, bias=False)
         self.dt_proj = nn.Linear(self.dt_rank, d_inner, bias=True)
@@ -81,18 +56,15 @@ class MambaMixer(nn.Module):
         self.A_log = nn.Parameter(torch.log(A))
         self.D = nn.Parameter(torch.ones(d_inner))
 
-    def _proj(self, layer, x, modality_ids):
-        return layer(x, modality_ids) if isinstance(layer, ExpertLinear) else layer(x)
-
-    def forward(self, x, modality_ids=None):
+    def forward(self, x):
         # x: [batch, L, d_model]; causal along L
         L = x.shape[1]
-        u, z = self._proj(self.in_proj, x, modality_ids).chunk(2, dim=-1)
+        u, z = self.in_proj(x).chunk(2, dim=-1)
         u = self.conv1d(u.transpose(1, 2))[..., :L].transpose(1, 2)
         u = F.silu(u)
         y = self.selective_scan(u)
         y = y * F.silu(z)
-        return self._proj(self.out_proj, y, modality_ids)
+        return self.out_proj(y)
 
     def selective_scan(self, u):
         dtype = u.dtype
@@ -125,18 +97,41 @@ class MambaMixer(nn.Module):
         return y.to(dtype)
 
 
-class MambaBlock(nn.Module):
-    """Standard Mamba residual block: x + Mixer(RMSNorm(x))."""
+class SelectiveStateSpace(nn.Module):
+    """Selective SSM for transformed inputs, with no local convolution.
 
-    def __init__(self, d_model, d_state=16, d_conv=4, expand=2, num_modalities=0):
+    Reuses the exact CUDA/reference recurrence of MambaMixer. Input projection,
+    local interaction, output gating and projection are owned by the caller.
+    """
+
+    def __init__(self, d_model, d_state=16, expand=2,
+                 dt_min=1e-3, dt_max=1e-1, dt_init_floor=1e-4):
         super().__init__()
-        self.norm = RMSNorm(d_model)
-        self.mixer = MambaMixer(d_model, d_state, d_conv, expand, num_modalities)
+        self.d_inner, self.d_state = expand * d_model, d_state
+        self.dt_rank = math.ceil(d_model / 16)
+        self.scan_backend = "auto"
+        self.x_proj = nn.Linear(self.d_inner, self.dt_rank + 2 * d_state, bias=False)
+        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
+        nn.init.uniform_(self.dt_proj.weight, -self.dt_rank ** -0.5, self.dt_rank ** -0.5)
+        dt = torch.exp(torch.rand(self.d_inner) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min))
+        dt = dt.clamp(min=dt_init_floor)
+        with torch.no_grad():
+            self.dt_proj.bias.copy_(dt + torch.log(-torch.expm1(-dt)))
+        A = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)
+        self.A_log = nn.Parameter(torch.log(A))
+        self.D = nn.Parameter(torch.ones(self.d_inner))
 
-    def forward(self, x, modality_ids=None, token_weights=None):
-        normalized = self.norm(x)
-        if token_weights is not None:
-            # Weight AFTER RMSNorm so normalization cannot cancel edge magnitude.
-            # The read token has weight 1; the residual path stays unchanged.
-            normalized = normalized * token_weights.unsqueeze(-1).to(normalized.dtype)
-        return x + self.mixer(normalized, modality_ids)
+    def forward(self, v):
+        return MambaMixer.selective_scan(self, v)
+
+
+class MambaBlock(nn.Module):
+    """Residual Mamba block with optional pre-Mixer RMSNorm."""
+
+    def __init__(self, d_model, d_state=16, d_conv=4, expand=2, use_rmsnorm=True):
+        super().__init__()
+        self.norm = RMSNorm(d_model) if use_rmsnorm else nn.Identity()
+        self.mixer = MambaMixer(d_model, d_state, d_conv, expand)
+
+    def forward(self, x):
+        return x + self.mixer(self.norm(x))
