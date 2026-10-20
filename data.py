@@ -4,6 +4,9 @@ Only the precomputed textf0, audio, visual, speakers, emotion labels and
 official train/test dialogue IDs are read. GraphSmile model modules are unused.
 """
 import pickle
+import json
+import re
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -11,6 +14,37 @@ from torch.utils.data import Dataset
 
 
 NUM_CLASSES = {"IEMOCAP": 6, "IEMOCAP4": 4, "MELD": 7, "CMUMOSEI7": 7}
+
+
+def session_id(dialogue_id):
+    match = re.match(r"^Ses0([1-5])[FM]_", str(dialogue_id))
+    if match is None:
+        raise ValueError(f"Unrecognized IEMOCAP session ID: {dialogue_id}")
+    return int(match.group(1))
+
+
+def split_train_validation(dataset, dataset_name, valid_ratio=0.1, validation_session=1,
+                           limit_dialogs=0):
+    """Split official train dialogues before any truncation or model training."""
+    if dataset_name in ("IEMOCAP", "IEMOCAP4"):
+        sessions = [session_id(key) for key in dataset.keys]
+        if any(s == 5 for s in sessions):
+            raise ValueError("Session 5 must be held out for test")
+        train = [i for i, s in enumerate(sessions) if s != validation_session]
+        valid = [i for i, s in enumerate(sessions) if s == validation_session]
+    else:
+        if not 0 < valid_ratio < 1:
+            raise ValueError("Validation selection requires 0 < valid_ratio < 1")
+        n_valid = max(1, int(valid_ratio * len(dataset)))
+        valid = list(range(n_valid))
+        train = list(range(n_valid, len(dataset)))
+    if limit_dialogs:
+        train, valid = train[:limit_dialogs], valid[:limit_dialogs]
+    if not train or not valid:
+        raise ValueError("Training and validation splits must both contain dialogues")
+    if set(train) & set(valid):
+        raise ValueError("Training/validation overlap")
+    return train, valid
 
 
 def build_neighbors(speakers, local_window):
@@ -59,7 +93,8 @@ def _mosei_class(values):
 class GraphSmileDataset(Dataset):
     """Official GraphSmile dialogue split, with textf0 as the only text stream."""
 
-    def __init__(self, path, dataset="IEMOCAP", split="train"):
+    def __init__(self, path, dataset="IEMOCAP", split="train", *,
+                 include_transcript=False, transcripts_path=None):
         if dataset not in NUM_CLASSES:
             raise ValueError(f"Unsupported dataset: {dataset}")
         if split not in ("train", "test"):
@@ -81,6 +116,14 @@ class GraphSmileDataset(Dataset):
                 raise ValueError("Expected GraphSmile single-text pickle layout")
             ids, speakers, labels, text, audio, visual = raw[0], raw[1], raw[2], raw[3], raw[4], raw[5]
             train_ids, test_ids = raw[7], raw[8]
+        transcripts = None
+        if include_transcript:
+            if transcripts_path:
+                transcripts = json.loads(Path(transcripts_path).read_text(encoding="utf-8"))
+            elif dataset in ("IEMOCAP", "MELD"):
+                transcripts = raw[9 if dataset == "IEMOCAP" else 10]
+            if not isinstance(transcripts, dict):
+                raise ValueError("Supply transcript JSON {dialogue_id: [utterance strings]} for this dataset")
         self.keys = list(train_ids if split == "train" else test_ids)
         if not self.keys:
             raise ValueError(f"Empty {split} split")
@@ -100,6 +143,12 @@ class GraphSmileDataset(Dataset):
                 raise ValueError(f"Non-finite feature in dialogue {key}")
             self.records.append({"id": key, "text": t, "audio": a, "visual": v,
                                  "speaker": _speaker_ids(speakers[key]), "label": y})
+            if include_transcript:
+                sentences = transcripts.get(key, transcripts.get(str(key)))
+                if (not isinstance(sentences, (list, tuple)) or len(sentences) != n or
+                        any(not isinstance(x, str) or not x.strip() for x in sentences)):
+                    raise ValueError(f"Missing/invalid transcripts for dialogue {key}")
+                self.records[-1]["transcript"] = list(sentences)
         first = self.records[0]
         self.feature_dims = {m: first[m].shape[1] for m in ("text", "audio", "visual")}
         for record in self.records:
@@ -135,10 +184,19 @@ class Collator:
             d, s = build_neighbors(item["speaker"], self.local_window)
             diff.append(d)
             same.append(s)
-        return {**features, "mask": mask, "label": labels,
+        batch = {**features, "mask": mask, "label": labels,
                 "diff": pack_neighbors(diff, max_length),
                 "same": pack_neighbors(same, max_length),
                 "ids": [item["id"] for item in items]}
+        if any("transcript" in item for item in items):
+            if not all("transcript" in item for item in items):
+                raise ValueError("Cannot mix records with and without transcripts")
+            batch["transcript"] = [item["transcript"] for item in items]
+            speaker = torch.full((batch_size, max_length), -1, dtype=torch.long)
+            for b, item in enumerate(items):
+                speaker[b, :len(item["speaker"])] = torch.tensor(item["speaker"])
+            batch["speaker"] = speaker
+        return batch
 
 
 def to_device(batch, device):
