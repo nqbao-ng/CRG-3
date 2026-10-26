@@ -16,7 +16,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from .config import LLMConfig, ModelConfig, model_config_from_dict
+from .config import LLMConfig, ModelConfig, LEARNED_HYPERGRAPH_MODES, model_config_from_dict
 from .data import (Collator, GraphSmileDataset, NUM_CLASSES, to_device,
                    split_train_validation, session_id)
 from .model import CRG3
@@ -76,6 +76,8 @@ def prepare_cache(args):
     cfg = model_config_from_dict(raw_cfg)
     if cfg.decoder_mode != "classifier":
         raise ValueError("prepare expects an existing classifier graph checkpoint")
+    if cfg.fusion_mode in LEARNED_HYPERGRAPH_MODES:
+        raise ValueError("Learned hypergraph readouts currently support classifier experiments, not this LLM cache")
     if checkpoint.get("dataset", args.dataset) != args.dataset:
         raise ValueError("Graph checkpoint and requested dataset differ")
     trainset = GraphSmileDataset(args.data_path, args.dataset, "train", include_transcript=True,
@@ -88,7 +90,8 @@ def prepare_cache(args):
         raise ValueError("Graph checkpoint/data label counts differ")
     names = label_names_from_json(args.label_names, trainset.num_classes)
     train_indices, val_indices = split_train_validation(
-        trainset, args.dataset, args.valid_ratio, args.validation_session, args.limit_dialogs)
+        trainset, args.dataset, args.valid_ratio, args.validation_session, args.limit_dialogs,
+        validation_split="session" if args.dataset in ("IEMOCAP", "IEMOCAP4") else "ratio")
     train_records = [trainset.records[i] for i in train_indices]
     val_records = [trainset.records[i] for i in val_indices]
     if args.dataset in ("IEMOCAP", "IEMOCAP4") and any(session_id(k) != 5 for k in testset.keys):

@@ -5,6 +5,8 @@ import torch.nn.functional as F
 
 from .graph import GraphEncoder
 from .attention_graph import AttentionGraphEncoder
+from .fusion import HyperedgeFusion
+from .hypergraph import UtteranceHypergraph, UtteranceHypergraphFusion
 from .config import LLMConfig
 from .llm import MultimodalLLMDecoder
 
@@ -27,6 +29,11 @@ class CRG3(nn.Module):
         self.graph = encoder(cfg)
         if self.decoder_mode == "classifier":
             self.classifier = nn.Sequential(nn.Dropout(cfg.dropout), nn.Linear(d, num_classes))
+            if cfg.fusion_mode in ("concat", "hypergraph_nodes"):
+                # Match the original sum model's encoder initialization and
+                # post-construction RNG, keeping only a new standard 3d head.
+                with torch.random.fork_rng(devices=[]):
+                    self.classifier[1] = nn.Linear(3 * d, num_classes)
         else:
             if label_names is None or len(label_names) != num_classes:
                 raise ValueError("LLM mode requires label_names in dataset class-ID order")
@@ -39,16 +46,31 @@ class CRG3(nn.Module):
                 self.graph.requires_grad_(False)
                 self.input_proj.eval()
                 self.graph.eval()
+        # Instantiate after the existing classifier/decoder to preserve old sum initialization.
+        if cfg.fusion_mode == "hypergraph_nodes":
+            self.fusion = UtteranceHypergraph(d, cfg.hypergraph_edges)
+        elif cfg.fusion_mode == "hypergraph_fusion":
+            self.fusion = UtteranceHypergraphFusion(d, cfg.hypergraph_edges)
+        else:
+            self.fusion = HyperedgeFusion(d) if cfg.fusion_mode == "hyperedge" else None
+        if self.decoder_mode == "llm" and self.llm_config.freeze_graph and self.fusion is not None:
+            self.fusion.requires_grad_(False)
+            self.fusion.eval()
 
     def train(self, mode=True):
         super().train(mode)
         if self.decoder_mode == "llm" and self.llm_config.freeze_graph:
             self.input_proj.eval()
             self.graph.eval()
+            if self.fusion is not None:
+                self.fusion.eval()
         return self
 
     def modality_features(self, batch):
-        """Return separate contextual T/A/V features, optionally from a frozen cache."""
+        """Return T/A/V [B,N,d]; direction-2 pooling occurs in fused_features.
+
+        hypergraph_fusion returns post-CRG nodes here, not updated node outputs.
+        """
         if "graph_features" in batch:
             if self.decoder_mode != "llm" or not self.llm_config.freeze_graph:
                 raise ValueError("Cached graph features require frozen-graph LLM mode")
@@ -58,25 +80,44 @@ class CRG3(nn.Module):
         h = {"t": self.input_proj["t"](batch["text"]) * mask,
              "a": self.input_proj["a"](batch["audio"]) * mask,
              "v": self.input_proj["v"](batch["visual"]) * mask}
-        q, diagnostics = self.graph(h, batch["diff"], batch["same"], valid)
+        if self.cfg.graph_update_mode == "attention_joint":
+            q, diagnostics = self.graph(h, batch.get("diff"), batch.get("same"), valid,
+                                        speakers=batch.get("speaker"),
+                                        adjacency=batch.get("adjacency"))
+        else:
+            q, diagnostics = self.graph(h, batch["diff"], batch["same"], valid)
+        if self.fusion is not None and self.cfg.fusion_mode != "hypergraph_fusion":
+            q, fusion_info = self.fusion(q, valid)
+            diagnostics["fusion"] = fusion_info
         return q, diagnostics
 
     def fused_features(self, batch):
         q, diagnostics = self.modality_features(batch)
+        if self.cfg.fusion_mode == "hypergraph_fusion":
+            fused, info = self.fusion(q, batch["mask"])
+            diagnostics["fusion"] = info
+            return fused, diagnostics
+        if self.cfg.fusion_mode in ("concat", "hypergraph_nodes"):
+            return torch.cat([q["t"], q["a"], q["v"]], dim=-1), diagnostics
         return q["t"] + q["a"] + q["v"], diagnostics
 
-    def forward(self, batch, target_indices=None):
+    def forward(self, batch, target_indices=None, return_aux=False):
         if self.decoder_mode == "llm":
             q, _ = self.modality_features(batch)
             return self.llm_decoder(q, batch, target_indices=target_indices)
-        fused, _ = self.fused_features(batch)
-        return self.classifier(fused)
+        fused, diagnostics = self.fused_features(batch)
+        logits = self.classifier(fused)
+        if return_aux:
+            # Tensor-only dictionary is compatible with DataParallel gather.
+            return {"logits": logits, **diagnostics.get("fusion", {})}
+        return logits
 
     def loss(self, batch, target_indices=None):
         if self.decoder_mode == "llm":
             return self(batch, target_indices=target_indices).loss
         valid = batch["mask"]
-        return F.cross_entropy(self(batch)[valid].float(), batch["label"][valid])
+        output = self(batch, return_aux=True)
+        return F.cross_entropy(output["logits"][valid].float(), batch["label"][valid])
 
     @torch.no_grad()
     def predict(self, batch, target_indices=None):
@@ -88,10 +129,13 @@ class CRG3(nn.Module):
 
     def encoder_state_dict(self):
         return {name: value for name, value in self.state_dict().items()
-                if name.startswith(("input_proj.", "graph."))}
+                if name.startswith(("input_proj.", "graph.", "fusion."))}
 
     def load_encoder_state_dict(self, state):
-        for prefix, module in (("input_proj.", self.input_proj), ("graph.", self.graph)):
+        modules = [("input_proj.", self.input_proj), ("graph.", self.graph)]
+        if self.fusion is not None:
+            modules.append(("fusion.", self.fusion))
+        for prefix, module in modules:
             module.load_state_dict({k[len(prefix):]: v for k, v in state.items()
                                     if k.startswith(prefix)}, strict=True)
 

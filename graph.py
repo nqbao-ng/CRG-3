@@ -102,7 +102,7 @@ class GraphLayer(nn.Module):
 class GraphEncoder(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        mamba_kw = dict(d_state=cfg.d_state, d_conv=cfg.d_conv, expand=cfg.expand,
+        mamba_kw = dict(d_state=cfg.d_state, d_conv=cfg.d_conv,
                         use_rmsnorm=True)
         self.layers = nn.ModuleList([
             nn.ModuleDict({m: GraphLayer(cfg, mamba_kw) for m in MODALITIES})

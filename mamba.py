@@ -33,10 +33,10 @@ class MambaMixer(nn.Module):
     """in_proj -> causal depthwise conv -> SiLU -> selective SSM, gated by SiLU(z) -> out_proj.
     """
 
-    def __init__(self, d_model, d_state=16, d_conv=4, expand=2,
+    def __init__(self, d_model, d_state=16, d_conv=4,
                  dt_min=1e-3, dt_max=1e-1, dt_init_floor=1e-4):
         super().__init__()
-        d_inner = expand * d_model
+        d_inner = d_model  # width-preserving: no expansion hyperparameter
         self.d_inner, self.d_state = d_inner, d_state
         self.scan_backend = "auto"  # reference is only for CPU checks/parity tests
         self.dt_rank = math.ceil(d_model / 16)
@@ -104,10 +104,10 @@ class SelectiveStateSpace(nn.Module):
     local interaction, output gating and projection are owned by the caller.
     """
 
-    def __init__(self, d_model, d_state=16, expand=2,
+    def __init__(self, d_model, d_state=16,
                  dt_min=1e-3, dt_max=1e-1, dt_init_floor=1e-4):
         super().__init__()
-        self.d_inner, self.d_state = expand * d_model, d_state
+        self.d_inner, self.d_state = d_model, d_state
         self.dt_rank = math.ceil(d_model / 16)
         self.scan_backend = "auto"
         self.x_proj = nn.Linear(self.d_inner, self.dt_rank + 2 * d_state, bias=False)
@@ -128,10 +128,10 @@ class SelectiveStateSpace(nn.Module):
 class MambaBlock(nn.Module):
     """Residual Mamba block with optional pre-Mixer RMSNorm."""
 
-    def __init__(self, d_model, d_state=16, d_conv=4, expand=2, use_rmsnorm=True):
+    def __init__(self, d_model, d_state=16, d_conv=4, use_rmsnorm=True):
         super().__init__()
         self.norm = RMSNorm(d_model) if use_rmsnorm else nn.Identity()
-        self.mixer = MambaMixer(d_model, d_state, d_conv, expand)
+        self.mixer = MambaMixer(d_model, d_state, d_conv)
 
     def forward(self, x):
         return x + self.mixer(self.norm(x))

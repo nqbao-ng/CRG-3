@@ -1,27 +1,33 @@
-"""Target-conditioned cross-modal messages -> ordered selective scan -> GateUpdate.
+"""Dense-adjacency Diff/Same pooling -> [Diff, Same, Adjacent, Target] scan.
 
-joint: softmax across (history position, source modality).
-per_modality: softmax over history independently per source modality, then /3.
-Both retain one message per history utterance; neither pools time before scan.
-Diff -> Same is synchronous: all Same sources read the completed Diff outputs.
-history uses one chronological stage and no speaker-relation parameters.
+Each nonempty relation applies softmax attention, then takes the arithmetic mean
+of weighted historical T/A/V sources (sum is retained for old checkpoints).
+Both groups read the same layer-input snapshot. One Mamba (original causal
+Conv1d or a scalar-gated local mixer) and one GateUpdate per receiving modality.
+Missing roles are compacted out; scan state resets per target. No future input.
+Adjacent can use the input snapshot (A), or the previous updated node in this
+same layer (B). B preserves gradient through the node chain; groups still use H.
+Same/Diff masks are dense [B,N,N] matrices, row=target and column=source.
+Only allowed adjacency entries participate in the joint history x T/A/V softmax.
 """
 import math
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from .graph import MODALITIES, GateUpdate
-from .mamba import RMSNorm, SelectiveStateSpace
+from .mamba import MambaBlock
+from .gated_local import GatedRoleMambaBlock
+from .adjacency import (adjacency_from_neighbors, build_speaker_adjacency,
+                        mask_dense_adjacency)
 
 
-def attention_messages(query, keys, values, mask, normalization):
+def attention_messages(query, keys, values, mask, normalization="joint"):
     """[rows,d], [rows,K,3,d], [rows,K] -> messages [rows,K,d], effective weights.
 
     Empty rows have exactly zero weights and finite gradients. Effective weights
-    sum to one across K*3 for either normalization (zero for empty rows).
+    sum to one across K*3 (zero for empty rows).
     """
     scores = (query[:, None, None].float() * keys.float()).sum(-1) / math.sqrt(query.shape[-1])
     expanded_mask = mask.unsqueeze(-1).expand_as(scores)
@@ -29,8 +35,6 @@ def attention_messages(query, keys, values, mask, normalization):
     scores = torch.where(mask.any(-1)[:, None, None], scores, torch.zeros_like(scores))
     if normalization == "joint":
         weights = scores.flatten(1).softmax(-1).reshape_as(scores)
-    elif normalization == "per_modality":
-        weights = scores.softmax(dim=1) / len(MODALITIES)
     else:
         raise ValueError(f"Unknown normalization: {normalization}")
     weights = weights.masked_fill(~expanded_mask, 0)
@@ -38,88 +42,177 @@ def attention_messages(query, keys, values, mask, normalization):
     return messages, weights
 
 
-def merge_history(diff, same, window):
-    """Merge disjoint Same/Diff lists into the original chronological history."""
-    idx = torch.cat([diff["idx"], same["idx"]], -1)
-    mask = torch.cat([diff["mask"], same["mask"]], -1)
-    sentinel = idx.shape[1]
-    idx = idx.masked_fill(~mask, sentinel).sort(-1).values
-    # Canonical width independent of how speakers partitioned the same history.
-    width = max(1, min(window, idx.shape[1] - 1))
-    idx = F.pad(idx, (0, max(0, width - idx.shape[-1])), value=sentinel)[..., :width]
-    mask = idx.ne(sentinel)
-    return {"idx": idx.masked_fill(~mask, -1), "mask": mask}
 
+def attention_pool(query, keys, values, mask, reduction="mean"):
+    """Pool alpha*v; mean divides by valid source count, excluding padding.
 
-class AttentionScanBlock(nn.Module):
-    """RMSNorm -> Linear -> SiLU -> selective SSM -> gate -> Linear, plus token residual.
-
-    There is no Conv1d: the graph attention interaction replaces local convolution.
+    Softmax still sums to one before this reduction. Thus mean is the old
+    attention sum scaled by 1/(valid utterances * source modalities).
+    Empty groups remain zero. sum preserves historical checkpoint behavior.
     """
+    messages, weights = attention_messages(query, keys, values, mask)
+    pooled = messages.sum(dim=1)
+    if reduction == "mean":
+        count = (mask.sum(dim=1) * values.shape[2]).clamp_min(1)
+        pooled = pooled / count.to(pooled.dtype).unsqueeze(-1)
+    elif reduction != "sum":
+        raise ValueError(f"Unknown attention pool reduction: {reduction}")
+    return pooled, weights
+
+
+def pack_role_tokens(tokens, present):
+    """Compact present roles in their original order; padding stays after the read.
+
+    tokens [rows,4,d], present [rows,4]. The target read is always present for
+    scanned rows. Return a max-4-token padded sequence and the read position.
+    """
+    positions = (present.long().cumsum(1) - 1).clamp_min(0)
+    packed = torch.zeros_like(tokens).scatter_add(
+        1, positions.unsqueeze(-1).expand_as(tokens), tokens * present.unsqueeze(-1))
+    return packed, present.sum(1) - 1
+
+
+def dense_adjacent_features(adjacency, features):
+    """A_adj @ H within one modality; A_adj is constrained to its subdiagonal."""
+    # Preserve the source dtype: AMP must not introduce an extra cast before
+    # the existing adjacent projection compared with the former shifted H.
+    with torch.autocast(device_type=features.device.type, enabled=False):
+        return torch.bmm(adjacency.to(features.dtype), features)
+
+
+class AttentionGraphLayer(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        self.norm = RMSNorm(cfg.hidden)
-        self.in_proj = nn.Linear(cfg.hidden, 2 * cfg.expand * cfg.hidden, bias=False)
-        self.ssm = SelectiveStateSpace(cfg.hidden, cfg.d_state, cfg.expand)
-        self.out_proj = nn.Linear(cfg.expand * cfg.hidden, cfg.hidden, bias=False)
-
-    def forward(self, sequence):
-        u, gate = self.in_proj(self.norm(sequence)).chunk(2, -1)
-        y = self.ssm(F.silu(u)) * F.silu(gate)
-        return sequence + self.out_proj(y)
-
-
-class AttentionRelationStage(nn.Module):
-    def __init__(self, cfg, normalization, relation):
-        super().__init__()
+        if cfg.graph_update_mode != "attention_joint":
+            raise ValueError("AttentionGraphLayer requires attention_joint")
         d = cfg.hidden
-        self.normalization = normalization
+        self.window = cfg.local_window
         self.chunk_size = cfg.attention_chunk_size
         self.use_checkpoint = cfg.attention_checkpoint
+        self.adjacent_source = cfg.attention_adjacent_source
+        self.pool_reduction = cfg.attention_pool_reduction
+        # Q/K/V projections are shared BETWEEN groups within this layer, while
+        # each group has its own softmax denominator and role embedding.
         self.pre_norm = nn.ModuleDict({m: nn.LayerNorm(d) for m in MODALITIES})
         self.query = nn.ModuleDict({m: nn.Linear(d, d, bias=False) for m in MODALITIES})
         self.key = nn.ModuleDict({m: nn.Linear(d, d, bias=False) for m in MODALITIES})
         self.value = nn.ModuleDict({m: nn.Linear(d, d, bias=False) for m in MODALITIES})
-        # Separate stage modules encode Diff/Same; history deliberately has no relation embedding.
-        self.relation_embedding = nn.Parameter(torch.zeros(d)) if relation != "history" else None
+        self.relation_embedding = nn.ParameterDict({
+            r: nn.Parameter(torch.zeros(d)) for r in ("diff", "same")})
+        self.adjacent_proj = nn.ModuleDict({m: nn.Linear(d, d) for m in MODALITIES})
+        self.adjacent_embedding = nn.Parameter(torch.zeros(d))
         self.read_proj = nn.ModuleDict({m: nn.Linear(d, d) for m in MODALITIES})
         self.read_embedding = nn.ParameterDict({m: nn.Parameter(torch.zeros(d)) for m in MODALITIES})
-        self.scan = nn.ModuleDict({m: AttentionScanBlock(cfg) for m in MODALITIES})
+        if cfg.joint_local_mixer == "conv":
+            self.scan = nn.ModuleDict({m: MambaBlock(d, cfg.d_state, cfg.d_conv,
+                                                   use_rmsnorm=True) for m in MODALITIES})
+        else:
+            self.scan = nn.ModuleDict({m: GatedRoleMambaBlock(
+                d, cfg.d_state, cfg.d_conv, mode=cfg.joint_local_mixer,
+                gate_normalization=cfg.joint_gate_normalization,
+                use_kernel=cfg.joint_local_kernel == "on") for m in MODALITIES})
         self.update = nn.ModuleDict({m: GateUpdate(d, cfg.dropout) for m in MODALITIES})
+        if cfg.graph_gate == "off":
+            # Construct identically first so removing gates does not shift the
+            # random initialization of context projections or subsequent layers.
+            # No unused gate parameters remain; W_c/dropout/residual are retained.
+            for update in self.update.values():
+                update.gate = None
 
-    def _scan_rows(self, query, keys, values, indices, mask, read, modality):
-        """Gather within checkpoint so large source tensors are not retained per chunk."""
-        gathered_keys = keys[indices]
-        gathered_values = values[indices]
-        messages, _ = attention_messages(query, gathered_keys, gathered_values, mask, self.normalization)
-        lengths = mask.sum(-1)
-        K = mask.shape[-1]
-        sequence = F.pad(messages, (0, 0, 0, 1))
-        sequence = sequence + F.one_hot(lengths, K + 1).to(sequence.dtype).unsqueeze(-1) * read[:, None]
-        out = self.scan[modality](sequence)
-        return out[torch.arange(len(out), device=out.device), lengths]
+    def _scan_rows(self, query, keys, values, dialogue_rows, diff_mask, same_mask,
+                   adjacent, adjacent_mask, read, modality):
+        # All N source utterances of the matching dialogue are available.
+        # Dense adjacency masks, rather than neighbor-index gathers, select
+        # edges before softmax. Materialize source rows inside checkpoint.
+        source_keys, source_values = keys[dialogue_rows], values[dialogue_rows]
+        diff, _ = attention_pool(query, source_keys, source_values, diff_mask,
+                                 self.pool_reduction)
+        same, _ = attention_pool(query, source_keys, source_values, same_mask,
+                                 self.pool_reduction)
+        tokens = torch.stack([
+            diff + self.relation_embedding['diff'],
+            same + self.relation_embedding['same'],
+            adjacent + self.adjacent_embedding, read], dim=1)
+        present = torch.stack([diff_mask.any(-1), same_mask.any(-1), adjacent_mask,
+                               torch.ones_like(adjacent_mask)], dim=1)
+        sequence, read_position = pack_role_tokens(tokens, present)
+        output = self.scan[modality](sequence)
+        return output[torch.arange(len(output), device=output.device), read_position]
 
-    def forward(self, H, table, valid):
-        B, N, d = H["t"].shape
-        idx, mask = table["idx"], table["mask"]
-        lengths = mask.sum(-1)
-        rows = (lengths.gt(0) & valid).reshape(-1).nonzero(as_tuple=True)[0]
+    def _updated_adjacent_nodes(self, H, valid, queries, keys, values, diff_mask,
+                                same_mask, adjacent_mask, read, active, modality):
+        """B: target i waits for Y_(i-1), while group queries/keys/values stay from H.
+
+        Batch dialogues at the same time step. Never detach Y_(i-1): this is
+        feature recurrence across targets, not reuse of the inner SSM state.
+        """
+        B, N, d = H.shape
+        nodes = []
+        previous = H.new_zeros(B, d)
+        batch_offsets = torch.arange(B, device=H.device) * N
+        for time in range(N):
+            all_rows = batch_offsets + time
+            rows = all_rows[active[all_rows]]
+            # Same normalization/projection as A, but applied to updated Y.
+            adjacent = self.adjacent_proj[modality](self.pre_norm[modality](previous))
+            chunks = []
+            for chunk in rows.split(self.chunk_size):
+                # split() on an empty tensor returns one empty chunk. CUDA scan
+                # cannot consume that batch (notably at time0 and window0).
+                if chunk.numel() == 0:
+                    continue
+                dialogue_rows = torch.div(chunk, N, rounding_mode='floor')
+                inputs = (queries[chunk], keys, values, dialogue_rows, diff_mask[chunk],
+                          same_mask[chunk], adjacent[dialogue_rows],
+                          adjacent_mask[chunk], read[chunk], modality)
+                if self.use_checkpoint and self.training and torch.is_grad_enabled():
+                    context = checkpoint(self._scan_rows, *inputs, use_reentrant=False)
+                else:
+                    context = self._scan_rows(*inputs)
+                chunks.append(context)
+            context = H.new_zeros(B, d)
+            if chunks:
+                dialogue_rows = torch.div(rows, N, rounding_mode='floor')
+                context = context.index_copy(0, dialogue_rows, torch.cat(chunks).to(context.dtype))
+            current = self.update[modality](H[:, time], context, valid[:, time])
+            nodes.append(current)
+            previous = current
+        return torch.stack(nodes, dim=1)
+
+    def forward(self, H, diff, same, valid, *, adjacency=None):
+        B, N, d = H['t'].shape
+        if adjacency is None:
+            adjacency = adjacency_from_neighbors(diff, same, valid, self.window)
+        else:
+            adjacency = mask_dense_adjacency(adjacency, valid, self.window)
         normed = {m: self.pre_norm[m](H[m]) for m in MODALITIES}
-        keys = torch.stack([self.key[m](normed[m]) for m in MODALITIES], dim=2).reshape(B * N, 3, d)
-        values = torch.stack([self.value[m](normed[m]) for m in MODALITIES], dim=2).reshape(B * N, 3, d)
-        if self.relation_embedding is not None:
-            values = values + self.relation_embedding
-        # Tables are padded chronologically. Convert dialogue-local indices to flat indices.
-        offsets = torch.arange(B, device=idx.device)[:, None, None] * N
-        source_indices = (idx.clamp_min(0) + offsets).reshape(B * N, -1)
-        source_masks = mask.reshape(B * N, -1)
+        keys = torch.stack([self.key[m](normed[m]) for m in MODALITIES], 2)
+        values = torch.stack([self.value[m](normed[m]) for m in MODALITIES], 2)
+        diff_mask = adjacency['diff'].reshape(B * N, N)
+        same_mask = adjacency['same'].reshape(B * N, N)
+        adjacent_mask = adjacency['adjacent'].any(-1).reshape(-1)
+        active = (diff_mask.any(-1) | same_mask.any(-1) | adjacent_mask) & valid.reshape(-1)
+        rows = active.nonzero(as_tuple=True)[0]
         result = {}
         for m in MODALITIES:
             queries = self.query[m](normed[m]).reshape(B * N, d)
             read = (self.read_proj[m](normed[m]) + self.read_embedding[m]).reshape(B * N, d)
+            if self.adjacent_source == "updated":
+                result[m] = self._updated_adjacent_nodes(
+                    H[m], valid, queries, keys, values, diff_mask,
+                    same_mask, adjacent_mask, read, active, m)
+                continue
+            # Adjacent adjacency only allows source i-1 in the same modality.
+            prev_features = dense_adjacent_features(adjacency['adjacent'], normed[m])
+            adjacent = self.adjacent_proj[m](prev_features).reshape(B * N, d)
             chunks = []
             for chunk in rows.split(self.chunk_size):
-                inputs = (queries[chunk], keys, values, source_indices[chunk], source_masks[chunk], read[chunk], m)
+                if chunk.numel() == 0:
+                    continue
+                dialogue_rows = torch.div(chunk, N, rounding_mode='floor')
+                inputs = (queries[chunk], keys, values, dialogue_rows, diff_mask[chunk],
+                          same_mask[chunk], adjacent[chunk],
+                          adjacent_mask[chunk], read[chunk], m)
                 if self.use_checkpoint and self.training and torch.is_grad_enabled():
                     context = checkpoint(self._scan_rows, *inputs, use_reentrant=False)
                 else:
@@ -129,39 +222,32 @@ class AttentionRelationStage(nn.Module):
             if chunks:
                 context = context.index_copy(0, rows, torch.cat(chunks).to(context.dtype))
             result[m] = self.update[m](H[m], context.reshape(B, N, d), valid)
-        return result, {"neighbor_count": lengths.detach()}
-
-
-class AttentionGraphLayer(nn.Module):
-    def __init__(self, cfg):
-        super().__init__()
-        self.history_only = cfg.graph_update_mode == "attention_history"
-        self.window = cfg.local_window
-        normalization = "per_modality" if cfg.graph_update_mode == "attention_per_modality" else "joint"
-        if self.history_only:
-            self.history = AttentionRelationStage(cfg, normalization, "history")
-        else:
-            self.diff = AttentionRelationStage(cfg, normalization, "diff")
-            self.same = AttentionRelationStage(cfg, normalization, "same")
-
-    def forward(self, H, diff, same, valid):
-        if self.history_only:
-            out, diag = self.history(H, merge_history(diff, same, self.window), valid)
-            return out, {"history": diag}
-        U, diag_d = self.diff(H, diff, valid)
-        out, diag_s = self.same(U, same, valid)
-        return out, {"diff": diag_d, "same": diag_s}
+        counts_d = diff_mask.sum(-1).reshape(B, N)
+        counts_s = same_mask.sum(-1).reshape(B, N)
+        token_count = (diff_mask.any(-1).long() + same_mask.any(-1).long()
+                       + adjacent_mask.long() + 1) * active.long()
+        return result, {'diff': {'neighbor_count': counts_d.detach()},
+                        'same': {'neighbor_count': counts_s.detach()},
+                        'adjacent_present': adjacent_mask.reshape(B, N).detach(),
+                        'scan_token_count': token_count.reshape(B, N).detach()}
 
 
 class AttentionGraphEncoder(nn.Module):
     def __init__(self, cfg):
         super().__init__()
+        self.window = cfg.local_window
         self.layers = nn.ModuleList([AttentionGraphLayer(cfg) for _ in range(cfg.graph_layers)])
         self.final_norm = nn.ModuleDict({m: nn.LayerNorm(cfg.hidden) for m in MODALITIES})
 
-    def forward(self, H, diff, same, valid):
+    def forward(self, H, diff, same, valid, *, speakers=None, adjacency=None):
+        # Build structural matrices once per encoder call, reuse across layers.
+        # Attention coefficients still depend on each layer's current features.
+        if adjacency is None:
+            adjacency = (build_speaker_adjacency(speakers, valid, self.window)
+                         if speakers is not None else
+                         adjacency_from_neighbors(diff, same, valid, self.window))
         diagnostics = {}
         for index, layer in enumerate(self.layers):
-            H, diagnostics[index] = layer(H, diff, same, valid)
+            H, diagnostics[index] = layer(H, diff, same, valid, adjacency=adjacency)
         mask = valid.unsqueeze(-1)
         return {m: self.final_norm[m](H[m]) * mask.to(H[m].dtype) for m in MODALITIES}, diagnostics

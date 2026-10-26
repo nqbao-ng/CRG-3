@@ -1,7 +1,8 @@
-"""Train CRG-3 on GraphSmile pickles; select by validation weighted F1, test once after selection."""
+"""Train CRG-3: best validation when enabled; valid_ratio=0 uses train/test and best test."""
 import argparse
 import json
 import random
+import time
 from dataclasses import asdict
 from pathlib import Path
 
@@ -11,7 +12,8 @@ import torch.nn.functional as F
 from sklearn.metrics import accuracy_score, f1_score
 from torch.utils.data import DataLoader, Subset, SubsetRandomSampler
 
-from CRG3.config import ModelConfig, GRAPH_UPDATE_MODES, model_config_from_dict
+from CRG3.config import (ModelConfig, GRAPH_UPDATE_MODES, FUSION_MODES,
+                         LEARNED_HYPERGRAPH_MODES, model_config_from_dict)
 from CRG3.data import (Collator, GraphSmileDataset, NUM_CLASSES, to_device,
                        split_train_validation, session_id)
 from CRG3.model import CRG3, build_model
@@ -33,8 +35,11 @@ def parse_args(argv=None):
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--limit_dialogs", type=int, default=0, help="First N dialogues per split for a smoke run")
     parser.add_argument("--valid_ratio", type=float, default=0.1,
-                        help="Validation fraction for non-IEMOCAP datasets; IEMOCAP uses a held-out session")
-    parser.add_argument("--validation_session", type=int, choices=(1, 2, 3, 4), default=1)
+                        help="Fraction of official train dialogues reserved for validation; 0 disables validation")
+    parser.add_argument("--validation_split", choices=("ratio", "session"), default="ratio",
+                        help="ratio: first valid_ratio of train dialogue IDs; session: held-out IEMOCAP session")
+    parser.add_argument("--validation_session", type=int, choices=(1, 2, 3, 4), default=1,
+                        help="Held-out IEMOCAP session, used only with --validation_split session")
     parser.add_argument("--patience", type=int, default=0,
                         help="Stop after this many epochs without validation weighted-F1 improvement; 0 disables")
     parser.add_argument("--min_epochs", type=int, default=1)
@@ -49,7 +54,19 @@ def parse_args(argv=None):
         options = {}
         if name == "graph_update_mode":
             options["choices"] = GRAPH_UPDATE_MODES
-        if name in ("model_type", "message_mode", "graph_rmsnorm", "graph_gate"):
+        if name == "fusion_mode":
+            options["choices"] = FUSION_MODES
+        if name == "attention_adjacent_source":
+            options["choices"] = ("input", "updated")
+        if name == "attention_pool_reduction":
+            options["choices"] = ("sum", "mean")
+        if name == "joint_local_mixer":
+            options["choices"] = ("conv", "gated_silu", "gmu_tanh")
+        if name == "joint_gate_normalization":
+            options["choices"] = ("sigmoid", "softmax")
+        if name in ("graph_gate", "joint_local_kernel"):
+            options["choices"] = ("on", "off")
+        if name in ("model_type", "message_mode", "graph_rmsnorm"):
             options["choices"] = (field.default,)
         if isinstance(field.default, bool):
             parser.add_argument(f"--{name}", action=argparse.BooleanOptionalAction, default=field.default)
@@ -72,6 +89,8 @@ def parse_args(argv=None):
         parser.error("Use python -m CRG3.run_llm for the generative LLM decoder")
     if not 0 <= args.valid_ratio < 1:
         parser.error("valid_ratio must be in [0, 1)")
+    if args.validation_split == "session" and args.dataset not in ("IEMOCAP", "IEMOCAP4"):
+        parser.error("session validation is only supported for IEMOCAP")
     if args.patience < 0 or args.min_epochs < 1:
         parser.error("patience must be nonnegative and min_epochs positive")
     if args.lr_patience < 0 or not 0 < args.lr_factor < 1 or args.min_lr <= 0:
@@ -92,14 +111,15 @@ def seed_everything(seed):
 
 
 def get_train_valid_sampler(trainset, valid=0.1, dataset="IEMOCAP", limit_dialogs=0,
-                            validation_session=1):
-    train, val = split_train_validation(trainset, dataset, valid, validation_session, limit_dialogs)
-    return SubsetRandomSampler(train), SubsetRandomSampler(val)
+                            validation_session=1, validation_split="ratio"):
+    train, val = split_train_validation(trainset, dataset, valid, validation_session, limit_dialogs,
+                                        validation_split)
+    return SubsetRandomSampler(train), SubsetRandomSampler(val) if val else None
 
 
 def get_IEMOCAP_loaders(batch_size=32, valid=0.1, num_workers=0, pin_memory=False,
                         data_path=None, local_window=20, limit_dialogs=0,
-                        dataset="IEMOCAP", validation_session=1):
+                        dataset="IEMOCAP", validation_session=1, validation_split="ratio"):
     trainset = GraphSmileDataset(data_path, dataset, "train")
     testset = GraphSmileDataset(data_path, dataset, "test")
     if trainset.feature_dims != testset.feature_dims:
@@ -109,21 +129,23 @@ def get_IEMOCAP_loaders(batch_size=32, valid=0.1, num_workers=0, pin_memory=Fals
     if dataset in ("IEMOCAP", "IEMOCAP4") and any(session_id(k) != 5 for k in testset.keys):
         raise ValueError("IEMOCAP test must contain only session 5")
     train_indices, val_indices = split_train_validation(
-        trainset, dataset, valid, validation_session, limit_dialogs)
+        trainset, dataset, valid, validation_session, limit_dialogs, validation_split)
     kwargs = dict(batch_size=batch_size, collate_fn=Collator(local_window),
                   num_workers=num_workers, pin_memory=pin_memory)
     train_loader = DataLoader(trainset, sampler=SubsetRandomSampler(train_indices), **kwargs)
     # Sequential validation batches make checkpoint verification deterministic.
-    valid_loader = DataLoader(Subset(trainset, val_indices), **kwargs)
+    valid_loader = DataLoader(Subset(trainset, val_indices), **kwargs) if val_indices else None
     if limit_dialogs:
         testset = Subset(testset, range(min(limit_dialogs, len(testset))))
     return train_loader, valid_loader, DataLoader(testset, **kwargs)
 
 
 def get_MELD_loaders(batch_size=32, valid=0.1, num_workers=0, pin_memory=False,
-                     data_path=None, local_window=20, limit_dialogs=0, validation_session=1):
+                     data_path=None, local_window=20, limit_dialogs=0, validation_session=1,
+                     validation_split="ratio"):
     return get_IEMOCAP_loaders(batch_size, valid, num_workers, pin_memory,
-                              data_path, local_window, limit_dialogs, "MELD", validation_session)
+                              data_path, local_window, limit_dialogs, "MELD", validation_session,
+                              validation_split)
 
 
 def get_class_weights(train_loader, num_classes, device, weighting="none"):
@@ -152,6 +174,15 @@ def train_or_eval_graph_model(model, loss_function, dataloader, epoch, device,
     else:
         model.eval()
     loss_sum, loss_denominator, n_utterances = 0.0, 0.0, 0
+    shared_norm_sum = 0.0
+    modality_sum = torch.zeros(3, dtype=torch.float64)
+    core = model.module if isinstance(model, torch.nn.DataParallel) else model
+    use_fusion = core.cfg.fusion_mode == "hyperedge"
+    use_hypergraph = core.cfg.fusion_mode in LEARNED_HYPERGRAPH_MODES
+    use_edge_fusion = core.cfg.fusion_mode == "hypergraph_fusion"
+    edge_sum = torch.zeros(core.cfg.hypergraph_edges, dtype=torch.float64) if use_hypergraph else None
+    beta_sum = torch.zeros(core.cfg.hypergraph_edges, dtype=torch.float64) if use_edge_fusion else None
+    hypergraph_norm_sum = 0.0
     labels, preds = [], []
 
     with torch.set_grad_enabled(train):
@@ -161,7 +192,8 @@ def train_or_eval_graph_model(model, loss_function, dataloader, epoch, device,
                 optimizer.zero_grad(set_to_none=True)
 
             with autocast():
-                logits = model(batch)
+                output = model(batch, return_aux=True) if (use_fusion or use_hypergraph) else {"logits": model(batch)}
+                logits = output["logits"]
                 mask = batch["mask"]
                 loss = loss_function(logits[mask].float(), batch["label"][mask])
 
@@ -172,6 +204,15 @@ def train_or_eval_graph_model(model, loss_function, dataloader, epoch, device,
             batch_denominator = (float(class_weights[batch["label"][mask]].sum().item())
                                  if class_weights is not None else count)
             loss_sum += float(loss.item()) * batch_denominator
+            if use_fusion:
+                shared_norm_sum += float(output["shared_update"][mask].detach().float().norm(dim=-1).sum())
+                modality_sum += output["modality_weights"][mask].detach().double().sum(0).cpu()
+            if use_hypergraph:
+                edge_sum += output["hypergraph_membership"][mask].detach().double().sum((0, 1)).cpu()
+                value = output["hypergraph_fused"] if use_edge_fusion else output["hypergraph_raw"]
+                hypergraph_norm_sum += float(value[mask].detach().float().norm(dim=-1).sum())
+                if use_edge_fusion:
+                    beta_sum += output["hypergraph_attention"][mask].detach().double().sum(0).cpu()
             loss_denominator += batch_denominator
             n_utterances += count
 
@@ -182,11 +223,22 @@ def train_or_eval_graph_model(model, loss_function, dataloader, epoch, device,
 
     if n_utterances == 0:
         raise ValueError("Empty dataloader")
-    return {"loss": loss_sum / loss_denominator,
+    metrics = {"loss": loss_sum / loss_denominator,
             "accuracy": 100 * accuracy_score(labels, preds),
             "weighted_f1": 100 * f1_score(labels, preds, average="weighted", zero_division=0),
             "macro_f1": 100 * f1_score(labels, preds, average="macro", zero_division=0),
             "n_utterances": n_utterances}
+    if use_fusion:
+        metrics.update(mean_shared_update_norm=shared_norm_sum / n_utterances,
+                       mean_modality_weights=dict(zip(("t", "a", "v"), (modality_sum / n_utterances).tolist())))
+    if use_hypergraph:
+        metrics.update(mean_hyperedge_membership=(edge_sum / (3 * n_utterances)).tolist())
+        if use_edge_fusion:
+            metrics.update(mean_hyperedge_attention=(beta_sum / n_utterances).tolist(),
+                           mean_hypergraph_fused_norm=hypergraph_norm_sum / n_utterances)
+        else:
+            metrics.update(mean_hypergraph_raw_norm=hypergraph_norm_sum / (3 * n_utterances))
+    return metrics
 
 
 def main(argv=None):
@@ -206,7 +258,8 @@ def main(argv=None):
     loader_kwargs = dict(batch_size=args.batch_size, valid=args.valid_ratio,
                          num_workers=args.num_workers, pin_memory=False,
                          data_path=args.data_path, local_window=args.local_window,
-                         limit_dialogs=args.limit_dialogs, validation_session=args.validation_session)
+                         limit_dialogs=args.limit_dialogs, validation_session=args.validation_session,
+                         validation_split=args.validation_split)
     if args.dataset == "IEMOCAP":
         train_loader, valid_loader, test_loader = get_IEMOCAP_loaders(**loader_kwargs)
     elif args.dataset == "MELD":
@@ -215,8 +268,9 @@ def main(argv=None):
         train_loader, valid_loader, test_loader = get_IEMOCAP_loaders(
             **loader_kwargs, dataset=args.dataset)
     train_data = train_loader.dataset
+    has_validation = valid_loader is not None
     split_sizes = (len(train_loader.sampler),
-                   len(valid_loader.dataset),
+                   len(valid_loader.dataset) if has_validation else 0,
                    len(test_loader.dataset))
     class_weights, class_counts = get_class_weights(
         train_loader, train_data.num_classes, device, args.class_weighting)
@@ -232,64 +286,98 @@ def main(argv=None):
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = (torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="max", factor=args.lr_factor, patience=args.lr_patience,
-        min_lr=args.min_lr) if args.lr_patience else None)
+        min_lr=args.min_lr) if args.lr_patience and has_validation else None)
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    if (out / "best_val.pt").exists() or (out / "results.json").exists():
+    if any((out / name).exists() for name in ("best_val.pt", "best_test.pt", "results.json")):
         raise ValueError("Choose a new out_dir; a completed or interrupted run already exists here")
     history, best, stale = [], None, 0
     split_ids = {"train": [str(train_data.keys[i]) for i in train_loader.sampler.indices],
-                 "validation": [str(train_data.keys[i]) for i in valid_loader.dataset.indices]}
+                 "validation": ([str(train_data.keys[i]) for i in valid_loader.dataset.indices]
+                                if has_validation else [])}
     test_data = test_loader.dataset
     test_indices = test_data.indices if isinstance(test_data, Subset) else range(len(test_data))
     test_base = test_data.dataset if isinstance(test_data, Subset) else test_data
     split_ids["test"] = [str(test_base.keys[i]) for i in test_indices]
-    selection = "best validation weighted F1"
+    selection = "best validation weighted F1" if has_validation else "best test weighted F1"
+    checkpoint_name = "best_val.pt" if has_validation else "best_test.pt"
+    phase = "validation" if has_validation else "test"
     report = {"name": "CRG-3", "selection": selection, "dataset": args.dataset,
               "text_feature": "textf0", "config": vars(args), "model_config": asdict(cfg),
               "feature_dims": train_data.feature_dims, "train_class_counts": class_counts,
               "split_dialogue_ids": split_ids,
               "parameter_count": sum(p.numel() for p in model.parameters()),
               "class_weights": class_weights.tolist() if class_weights is not None else None,
+              "validation_enabled": has_validation,
+              "lr_scheduler_active": scheduler is not None,
+              "early_stopping_active": bool(args.patience and has_validation),
               "epochs": history}
-    print(f"CRG3 | {args.dataset} | {cfg.graph_update_mode} | device={device} | "
+    print(f"CRG3 | {args.dataset} | {cfg.graph_update_mode} | fusion={cfg.fusion_mode} | device={device} | "
           f"train={split_sizes[0]} val={split_sizes[1]} test={split_sizes[2]} | selection={selection}", flush=True)
+    def synchronize():
+        if device.type == "cuda":
+            for index in range(torch.cuda.device_count() if args.multi_gpu else 1):
+                torch.cuda.synchronize(index)
+
+    started = time.perf_counter()
     for epoch in range(1, args.epochs + 1):
+        synchronize()
+        tick = time.perf_counter()
+        epoch_lr = optimizer.param_groups[0]["lr"]
         train_metrics = train_or_eval_graph_model(
             model, train_loss_function, train_loader, epoch, device, autocast,
             optimizer=optimizer, train=True, max_grad_norm=args.max_grad_norm)
-        val_metrics = train_or_eval_graph_model(model, F.cross_entropy, valid_loader, epoch, device, autocast)
+        synchronize()
+        train_seconds = time.perf_counter() - tick
+        eval_start = time.perf_counter()
+        eval_metrics = train_or_eval_graph_model(
+            model, F.cross_entropy, valid_loader if has_validation else test_loader, epoch, device, autocast)
+        synchronize()
+        evaluation_seconds = time.perf_counter() - eval_start
         if scheduler is not None:
-            scheduler.step(val_metrics["weighted_f1"])
-        record = {"epoch": epoch, "train": train_metrics, "validation": val_metrics,
-                  "lr": optimizer.param_groups[0]["lr"]}
+            scheduler.step(eval_metrics["weighted_f1"])
+        record = {"epoch": epoch, "train": train_metrics, phase: eval_metrics,
+                  "lr": epoch_lr, "next_lr": optimizer.param_groups[0]["lr"],
+                  "train_seconds": train_seconds, "evaluation_seconds": evaluation_seconds}
         history.append(record)
-        if best is None or val_metrics["weighted_f1"] > best["weighted_f1"]:
-            best = {"epoch": epoch, **val_metrics}
+        save_start = time.perf_counter()
+        if best is None or eval_metrics["weighted_f1"] > best["weighted_f1"]:
+            best = {"epoch": epoch, **eval_metrics}
             stale = 0
             state = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
             torch.save({"model": state, "model_config": asdict(cfg),
                         "feature_dims": train_data.feature_dims, "num_classes": train_data.num_classes,
                         "dataset": args.dataset, "epoch": epoch, "selection": selection,
-                        "validation_metrics": val_metrics, "split_dialogue_ids": split_ids,
-                        "training_config": vars(args)}, out / "best_val.pt")
+                        phase + "_metrics": eval_metrics, "split_dialogue_ids": split_ids,
+                        "training_config": vars(args)}, out / checkpoint_name)
         else:
             stale += 1
-        report["best_validation"] = best
+        record["checkpoint_seconds"] = time.perf_counter() - save_start
+        record["epoch_seconds"] = time.perf_counter() - tick
+        report["best_validation"] = best if has_validation else None
+        if not has_validation:
+            report["best_test"] = best
         (out / "results.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
         print(f"epoch {epoch:03d} train_loss={train_metrics['loss']:.4f} "
-              f"train_wF1={train_metrics['weighted_f1']:.2f} val_wF1={val_metrics['weighted_f1']:.2f} "
-              f"best_epoch={best['epoch']}", flush=True)
-        if args.patience and epoch >= args.min_epochs and stale >= args.patience:
+              f"train_acc={train_metrics['accuracy']:.2f} train_wF1={train_metrics['weighted_f1']:.2f} "
+              f"train_macroF1={train_metrics['macro_f1']:.2f} "
+              f"{phase}_acc={eval_metrics['accuracy']:.2f} {phase}_wF1={eval_metrics['weighted_f1']:.2f} "
+              f"lr={epoch_lr:.2e} best_epoch={best['epoch']} "
+              f"train_seconds={train_seconds:.2f} seconds={record['epoch_seconds']:.2f}", flush=True)
+        if has_validation and args.patience and epoch >= args.min_epochs and stale >= args.patience:
             break
-    # No test evaluation or test-based checkpoint selection occurs in the epoch loop.
-    saved = torch.load(out / "best_val.pt", map_location=device, weights_only=False)
+    report["training_evaluation_seconds"] = time.perf_counter() - started
+    # With validation, test is evaluated only after restoring the selected checkpoint.
+    saved = torch.load(out / checkpoint_name, map_location=device, weights_only=False)
     core = model.module if isinstance(model, torch.nn.DataParallel) else model
     core.load_state_dict(saved["model"], strict=True)
     test_metrics = train_or_eval_graph_model(model, F.cross_entropy, test_loader, best["epoch"], device, autocast)
-    report["test_at_best_validation"] = {"epoch": best["epoch"], **test_metrics}
+    report["test_at_best_validation" if has_validation else "test_at_best_test"] = {
+        "epoch": best["epoch"], **test_metrics}
+    report["test_evaluations_during_training"] = 0 if has_validation else len(history)
+    report["test_evaluations_after_selection"] = 1
     (out / "results.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-    print(f"Best validation epoch={best['epoch']} | val_wF1={best['weighted_f1']:.2f} | "
+    print(f"Selection={selection} | epoch={best['epoch']} | selected_wF1={best['weighted_f1']:.2f} | "
           f"test_wF1={test_metrics['weighted_f1']:.2f}", flush=True)
 
 
