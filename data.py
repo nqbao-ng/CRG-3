@@ -24,24 +24,31 @@ def session_id(dialogue_id):
 
 
 def split_train_validation(dataset, dataset_name, valid_ratio=0.1, validation_session=1,
-                           limit_dialogs=0):
+                           limit_dialogs=0, validation_split="ratio"):
     """Split official train dialogues before any truncation or model training."""
+    if validation_split not in ("ratio", "session"):
+        raise ValueError("validation_split must be 'ratio' or 'session'")
+    if not 0 <= valid_ratio < 1:
+        raise ValueError("valid_ratio must be in [0, 1)")
     if dataset_name in ("IEMOCAP", "IEMOCAP4"):
         sessions = [session_id(key) for key in dataset.keys]
         if any(s == 5 for s in sessions):
             raise ValueError("Session 5 must be held out for test")
+    elif validation_split == "session":
+        raise ValueError("Session validation is only supported for IEMOCAP")
+    if valid_ratio == 0:
+        train, valid = list(range(len(dataset))), []
+    elif validation_split == "session":
         train = [i for i, s in enumerate(sessions) if s != validation_session]
         valid = [i for i, s in enumerate(sessions) if s == validation_session]
     else:
-        if not 0 < valid_ratio < 1:
-            raise ValueError("Validation selection requires 0 < valid_ratio < 1")
         n_valid = max(1, int(valid_ratio * len(dataset)))
         valid = list(range(n_valid))
         train = list(range(n_valid, len(dataset)))
     if limit_dialogs:
         train, valid = train[:limit_dialogs], valid[:limit_dialogs]
-    if not train or not valid:
-        raise ValueError("Training and validation splits must both contain dialogues")
+    if not train or (valid_ratio > 0 and not valid):
+        raise ValueError("Training must be nonempty; positive valid_ratio also requires validation")
     if set(train) & set(valid):
         raise ValueError("Training/validation overlap")
     return train, valid
@@ -172,6 +179,7 @@ class Collator:
         max_length = max(len(item["label"]) for item in items)
         mask = torch.zeros(batch_size, max_length, dtype=torch.bool)
         labels = torch.full((batch_size, max_length), -100, dtype=torch.long)
+        speaker = torch.full((batch_size, max_length), -1, dtype=torch.long)
         features = {m: torch.zeros(batch_size, max_length, items[0][m].shape[1])
                     for m in ("text", "audio", "visual")}
         diff, same = [], []
@@ -179,12 +187,13 @@ class Collator:
             n = len(item["label"])
             mask[b, :n] = True
             labels[b, :n] = torch.as_tensor(item["label"], dtype=torch.long)
+            speaker[b, :n] = torch.as_tensor(item["speaker"], dtype=torch.long)
             for m in features:
                 features[m][b, :n] = torch.as_tensor(item[m], dtype=torch.float32)
             d, s = build_neighbors(item["speaker"], self.local_window)
             diff.append(d)
             same.append(s)
-        batch = {**features, "mask": mask, "label": labels,
+        batch = {**features, "mask": mask, "label": labels, "speaker": speaker,
                 "diff": pack_neighbors(diff, max_length),
                 "same": pack_neighbors(same, max_length),
                 "ids": [item["id"] for item in items]}
@@ -192,10 +201,6 @@ class Collator:
             if not all("transcript" in item for item in items):
                 raise ValueError("Cannot mix records with and without transcripts")
             batch["transcript"] = [item["transcript"] for item in items]
-            speaker = torch.full((batch_size, max_length), -1, dtype=torch.long)
-            for b, item in enumerate(items):
-                speaker[b, :len(item["speaker"])] = torch.tensor(item["speaker"])
-            batch["speaker"] = speaker
         return batch
 
 
