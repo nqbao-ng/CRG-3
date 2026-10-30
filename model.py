@@ -48,9 +48,12 @@ class CRG3(nn.Module):
                 self.graph.eval()
         # Instantiate after the existing classifier/decoder to preserve old sum initialization.
         if cfg.fusion_mode == "hypergraph_nodes":
-            self.fusion = UtteranceHypergraph(d, cfg.hypergraph_edges)
+            self.fusion = UtteranceHypergraph(d, cfg.hypergraph_edges,
+                confidence=cfg.hypergraph_confidence, num_classes=num_classes)
         elif cfg.fusion_mode == "hypergraph_fusion":
-            self.fusion = UtteranceHypergraphFusion(d, cfg.hypergraph_edges)
+            self.fusion = UtteranceHypergraphFusion(d, cfg.hypergraph_edges,
+                cfg.hypergraph_fusion_temperature, confidence=cfg.hypergraph_confidence,
+                num_classes=num_classes)
         else:
             self.fusion = HyperedgeFusion(d) if cfg.fusion_mode == "hyperedge" else None
         if self.decoder_mode == "llm" and self.llm_config.freeze_graph and self.fusion is not None:
@@ -115,9 +118,24 @@ class CRG3(nn.Module):
     def loss(self, batch, target_indices=None):
         if self.decoder_mode == "llm":
             return self(batch, target_indices=target_indices).loss
-        valid = batch["mask"]
         output = self(batch, return_aux=True)
-        return F.cross_entropy(output["logits"][valid].float(), batch["label"][valid])
+        return self.classification_losses(output, batch["label"], batch["mask"])["loss"]
+
+    def classification_losses(self, output, labels, valid, loss_function=F.cross_entropy):
+        """Same masked objective for model.loss, CLI/notebooks and DataParallel.
+
+        Confidence never reads labels in forward. Only auxiliary CE uses labels;
+        the detached routing score prevents main CE from inflating confidence.
+        Apply the caller's CE class weighting/smoothing to all three heads too.
+        """
+        main = loss_function(output["logits"][valid].float(), labels[valid])
+        if not self.cfg.hypergraph_confidence:
+            return {"loss": main, "classification_loss": main}
+        logits = output["hypergraph_confidence_logits"][valid].float()
+        auxiliary = torch.stack([loss_function(logits[:, m], labels[valid])
+                                 for m in range(3)]).mean()
+        return {"loss": main + self.cfg.hypergraph_confidence_aux_weight * auxiliary,
+                "classification_loss": main, "confidence_aux_loss": auxiliary}
 
     @torch.no_grad()
     def predict(self, batch, target_indices=None):

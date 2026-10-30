@@ -48,8 +48,9 @@ def build_speaker_adjacency(speakers, valid, window):
 def adjacency_from_neighbors(diff, same, valid, window):
     """Compatibility for old/manual batches: materialize adjacency before attention.
 
-    Historical neighbor tables remain supported by the baseline and callers,
-    but the joint layer itself attends over dense adjacency rows, not index lists.
+    Historical neighbor tables remain supported by the baseline and callers.
+    Joint attention gathers its causal window, then slices these adjacency rows
+    to retain explicit edge connectivity within that window.
     """
     B, N = valid.shape
     result = {}

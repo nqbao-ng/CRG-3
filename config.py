@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import math
 
 
 GRAPH_UPDATE_MODES = ("baseline", "attention_joint")
@@ -29,6 +30,9 @@ class ModelConfig:
     joint_local_kernel: str = "on"  # off: gated_silu/gmu_tanh without the learned k_l
     fusion_mode: str = "hyperedge"
     hypergraph_edges: int = 4  # shared anchors; independent mean hyperedges per utterance
+    hypergraph_fusion_temperature: float = 1.0  # beta=softmax(edge_scores / temperature)
+    hypergraph_confidence: bool = False  # modality max-probability scales node-to-edge writes
+    hypergraph_confidence_aux_weight: float = 0.1  # mean of three modality CE losses
     decoder_mode: str = "classifier"  # classifier | llm
 
     def __post_init__(self):
@@ -76,6 +80,20 @@ class ModelConfig:
             raise ValueError(f"fusion_mode must be one of {FUSION_MODES}")
         if self.hypergraph_edges < 1:
             raise ValueError("hypergraph_edges must be positive")
+        if not math.isfinite(self.hypergraph_fusion_temperature) or self.hypergraph_fusion_temperature <= 0:
+            raise ValueError("hypergraph_fusion_temperature must be finite and positive")
+        if self.hypergraph_fusion_temperature != 1.0 and self.fusion_mode != "hypergraph_fusion":
+            raise ValueError("hypergraph_fusion_temperature only applies to hypergraph_fusion")
+        if not isinstance(self.hypergraph_confidence, bool):
+            raise ValueError("hypergraph_confidence must be boolean")
+        if (not math.isfinite(self.hypergraph_confidence_aux_weight)
+                or self.hypergraph_confidence_aux_weight < 0):
+            raise ValueError("hypergraph_confidence_aux_weight must be finite and nonnegative")
+        if self.hypergraph_confidence:
+            if self.fusion_mode not in LEARNED_HYPERGRAPH_MODES:
+                raise ValueError("hypergraph_confidence requires hypergraph_nodes or hypergraph_fusion")
+            if self.hypergraph_confidence_aux_weight <= 0:
+                raise ValueError("Confidence heads require a positive auxiliary CE weight")
         if self.fusion_mode in LEARNED_HYPERGRAPH_MODES and self.decoder_mode != "classifier":
             raise ValueError("Learned hypergraph readouts currently support the classifier decoder only")
 

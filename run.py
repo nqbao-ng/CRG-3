@@ -180,6 +180,10 @@ def train_or_eval_graph_model(model, loss_function, dataloader, epoch, device,
     use_fusion = core.cfg.fusion_mode == "hyperedge"
     use_hypergraph = core.cfg.fusion_mode in LEARNED_HYPERGRAPH_MODES
     use_edge_fusion = core.cfg.fusion_mode == "hypergraph_fusion"
+    use_confidence = core.cfg.hypergraph_confidence
+    main_loss_sum = aux_loss_sum = 0.0
+    confidence_sum = torch.zeros(3, dtype=torch.float64)
+    confidence_correct = torch.zeros(3, dtype=torch.float64)
     edge_sum = torch.zeros(core.cfg.hypergraph_edges, dtype=torch.float64) if use_hypergraph else None
     beta_sum = torch.zeros(core.cfg.hypergraph_edges, dtype=torch.float64) if use_edge_fusion else None
     hypergraph_norm_sum = 0.0
@@ -195,7 +199,8 @@ def train_or_eval_graph_model(model, loss_function, dataloader, epoch, device,
                 output = model(batch, return_aux=True) if (use_fusion or use_hypergraph) else {"logits": model(batch)}
                 logits = output["logits"]
                 mask = batch["mask"]
-                loss = loss_function(logits[mask].float(), batch["label"][mask])
+                losses = core.classification_losses(output, batch["label"], mask, loss_function)
+                loss = losses["loss"]
 
             labels.extend(batch["label"][mask].detach().cpu().tolist())
             preds.extend(logits[mask].detach().argmax(-1).cpu().tolist())
@@ -204,6 +209,12 @@ def train_or_eval_graph_model(model, loss_function, dataloader, epoch, device,
             batch_denominator = (float(class_weights[batch["label"][mask]].sum().item())
                                  if class_weights is not None else count)
             loss_sum += float(loss.item()) * batch_denominator
+            if use_confidence:
+                main_loss_sum += float(losses["classification_loss"].item()) * batch_denominator
+                aux_loss_sum += float(losses["confidence_aux_loss"].item()) * batch_denominator
+                confidence_sum += output["hypergraph_confidence"][mask].detach().double().sum(0).cpu()
+                confidence_correct += (output["hypergraph_confidence_logits"][mask].detach().argmax(-1)
+                                       == batch["label"][mask].unsqueeze(-1)).double().sum(0).cpu()
             if use_fusion:
                 shared_norm_sum += float(output["shared_update"][mask].detach().float().norm(dim=-1).sum())
                 modality_sum += output["modality_weights"][mask].detach().double().sum(0).cpu()
@@ -238,6 +249,13 @@ def train_or_eval_graph_model(model, loss_function, dataloader, epoch, device,
                            mean_hypergraph_fused_norm=hypergraph_norm_sum / n_utterances)
         else:
             metrics.update(mean_hypergraph_raw_norm=hypergraph_norm_sum / (3 * n_utterances))
+    if use_confidence:
+        metrics.update(classification_loss=main_loss_sum / loss_denominator,
+                       confidence_aux_loss=aux_loss_sum / loss_denominator,
+                       mean_modality_confidence=dict(zip(("t", "a", "v"),
+                           (confidence_sum / n_utterances).tolist())),
+                       confidence_head_accuracy=dict(zip(("t", "a", "v"),
+                           (100 * confidence_correct / n_utterances).tolist())))
     return metrics
 
 
