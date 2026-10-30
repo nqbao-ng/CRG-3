@@ -1,4 +1,4 @@
-"""Dense-adjacency Diff/Same pooling -> [Diff, Same, Adjacent, Target] scan.
+"""Window-gathered Diff/Same pooling -> [Diff, Same, Adjacent, Target] scan.
 
 Each nonempty relation applies softmax attention, then takes the arithmetic mean
 of weighted historical T/A/V sources (sum is retained for old checkpoints).
@@ -7,8 +7,9 @@ Conv1d or a scalar-gated local mixer) and one GateUpdate per receiving modality.
 Missing roles are compacted out; scan state resets per target. No future input.
 Adjacent can use the input snapshot (A), or the previous updated node in this
 same layer (B). B preserves gradient through the node chain; groups still use H.
-Same/Diff masks are dense [B,N,N] matrices, row=target and column=source.
-Only allowed adjacency entries participate in the joint history x T/A/V softmax.
+Same/Diff connectivity remains dense [B,N,N], row=target and column=source.
+Gather at most W historical K/V positions before attention; slice connectivity
+to the same positions. Only allowed edges participate in the joint softmax.
 """
 import math
 
@@ -119,12 +120,24 @@ class AttentionGraphLayer(nn.Module):
             for update in self.update.values():
                 update.gate = None
 
-    def _scan_rows(self, query, keys, values, dialogue_rows, diff_mask, same_mask,
+    def _scan_rows(self, query, keys, values, target_rows, diff_mask, same_mask,
                    adjacent, adjacent_mask, read, modality):
-        # All N source utterances of the matching dialogue are available.
-        # Dense adjacency masks, rather than neighbor-index gathers, select
-        # edges before softmax. Materialize source rows inside checkpoint.
-        source_keys, source_values = keys[dialogue_rows], values[dialogue_rows]
+        # target_rows are flattened B*N indices. Gather only the chronological
+        # interval [i-W, i), inside checkpoint so its K/V activations can be
+        # discarded and recomputed. No [rows,N,3,d] source copy is created.
+        length = keys.shape[1]
+        width = min(self.window, max(0, length - 1))
+        dialogue_rows = torch.div(target_rows, length, rounding_mode='floor')
+        positions = (target_rows.remainder(length)[:, None] - width
+                     + torch.arange(width, device=keys.device)[None])
+        present_sources = positions >= 0
+        source_indices = positions.clamp_min(0)
+        source_keys = keys[dialogue_rows[:, None], source_indices]
+        source_values = values[dialogue_rows[:, None], source_indices]
+        # Near the start of a dialogue, clamped negative positions are padding,
+        # not repeated edges to source0. Preserve any explicitly blocked edges.
+        diff_mask = diff_mask.gather(1, source_indices) & present_sources
+        same_mask = same_mask.gather(1, source_indices) & present_sources
         diff, _ = attention_pool(query, source_keys, source_values, diff_mask,
                                  self.pool_reduction)
         same, _ = attention_pool(query, source_keys, source_values, same_mask,
@@ -162,7 +175,7 @@ class AttentionGraphLayer(nn.Module):
                 if chunk.numel() == 0:
                     continue
                 dialogue_rows = torch.div(chunk, N, rounding_mode='floor')
-                inputs = (queries[chunk], keys, values, dialogue_rows, diff_mask[chunk],
+                inputs = (queries[chunk], keys, values, chunk, diff_mask[chunk],
                           same_mask[chunk], adjacent[dialogue_rows],
                           adjacent_mask[chunk], read[chunk], modality)
                 if self.use_checkpoint and self.training and torch.is_grad_enabled():
@@ -209,8 +222,7 @@ class AttentionGraphLayer(nn.Module):
             for chunk in rows.split(self.chunk_size):
                 if chunk.numel() == 0:
                     continue
-                dialogue_rows = torch.div(chunk, N, rounding_mode='floor')
-                inputs = (queries[chunk], keys, values, dialogue_rows, diff_mask[chunk],
+                inputs = (queries[chunk], keys, values, chunk, diff_mask[chunk],
                           same_mask[chunk], adjacent[chunk],
                           adjacent_mask[chunk], read[chunk], m)
                 if self.use_checkpoint and self.training and torch.is_grad_enabled():

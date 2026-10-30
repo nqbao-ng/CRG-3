@@ -73,6 +73,10 @@ class ForwardCost:
         receivers = 1 if isinstance(module, UtteranceHypergraphFusion) else modalities
         reads = batch * length * receivers * hidden * (2 * edges - 1)
         self.counts['hypergraph_flops'] += scores + writes + mean + reads
+        if module.confidence_heads is not None:
+            # A=P*c; normalized source weights returned for diagnostics. Head
+            # Linear FLOPs use regular hooks; softmax/max/detach are excluded.
+            self.counts['hypergraph_flops'] += batch * length * edges * (2 * modalities + 1)
         self.counts['hypergraph_calls'] += 1
 
     def __enter__(self):
