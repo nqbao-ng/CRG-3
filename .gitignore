@@ -1,0 +1,3 @@
+__ pycache __ /
+*. py[cod]
+.pytest_cache/
