@@ -1,10 +1,8 @@
 from dataclasses import dataclass
-import math
 
 
 GRAPH_UPDATE_MODES = ("baseline", "attention_joint")
-LEARNED_HYPERGRAPH_MODES = ("hypergraph_nodes", "hypergraph_fusion")
-FUSION_MODES = ("sum", "concat", "hyperedge", *LEARNED_HYPERGRAPH_MODES)
+FUSION_MODES = ("sum", "concat")
 
 
 @dataclass
@@ -21,18 +19,14 @@ class ModelConfig:
     graph_update_mode: str = "baseline"  # see GRAPH_UPDATE_MODES
     graph_gate: str = "on"  # off: joint only, retain context projection/dropout/residual
     attention_chunk_size: int = 64  # target rows processed together, per modality
-    attention_checkpoint: bool = True
     attention_layout: str = "pooled_roles_v1"  # Diff/Same pooling -> Adjacent -> Target
     attention_adjacent_source: str = "updated"  # input: A, updated: recurrent B
     attention_pool_reduction: str = "mean"  # arithmetic mean after weighting
-    joint_local_mixer: str = "conv"  # conv | gated_silu | gmu_tanh (joint only)
+    attention_score: str = "dot_product"  # dot_product | gat (additive scorer only)
+    joint_local_mixer: str = "conv"  # conv | gated_silu | gmu_tanh | gmu_tanh_no_uz
     joint_gate_normalization: str = "sigmoid"  # same scalar gates for both variants
     joint_local_kernel: str = "on"  # off: gated_silu/gmu_tanh without the learned k_l
-    fusion_mode: str = "hyperedge"
-    hypergraph_edges: int = 4  # shared anchors; independent mean hyperedges per utterance
-    hypergraph_fusion_temperature: float = 1.0  # beta=softmax(edge_scores / temperature)
-    hypergraph_confidence: bool = False  # modality max-probability scales node-to-edge writes
-    hypergraph_confidence_aux_weight: float = 0.1  # mean of three modality CE losses
+    fusion_mode: str = "sum"  # sum: Linear(H,C); concat(T,A,V): Linear(3H,C)
     decoder_mode: str = "classifier"  # classifier | llm
 
     def __post_init__(self):
@@ -54,16 +48,23 @@ class ModelConfig:
             raise ValueError("attention_adjacent_source must be 'input' or 'updated'")
         if self.attention_pool_reduction not in ("sum", "mean"):
             raise ValueError("attention_pool_reduction must be 'sum' or 'mean'")
-        if self.joint_local_mixer not in ("conv", "gated_silu", "gmu_tanh"):
-            raise ValueError("joint_local_mixer must be conv, gated_silu or gmu_tanh")
+        if self.attention_score not in ("dot_product", "gat"):
+            raise ValueError("attention_score must be 'dot_product' or 'gat'")
+        if self.attention_score == "gat" and self.graph_update_mode != "attention_joint":
+            raise ValueError("GAT attention scoring is only supported in attention_joint")
+        if self.joint_local_mixer not in ("conv", "gated_silu", "gmu_tanh", "gmu_tanh_no_uz"):
+            raise ValueError("joint_local_mixer must be conv, gated_silu, gmu_tanh or gmu_tanh_no_uz")
         if self.joint_gate_normalization not in ("sigmoid", "softmax"):
             raise ValueError("joint_gate_normalization must be sigmoid or softmax")
         if self.joint_local_kernel not in ("on", "off"):
             raise ValueError("joint_local_kernel must be on or off")
         if self.joint_local_kernel == "off" and (
                 self.graph_update_mode != "attention_joint"
-                or self.joint_local_mixer not in ("gated_silu", "gmu_tanh")):
-            raise ValueError("Kernel ablation requires attention_joint with gated_silu or gmu_tanh")
+                or self.joint_local_mixer not in ("gated_silu", "gmu_tanh", "gmu_tanh_no_uz")):
+            raise ValueError("Kernel ablation requires attention_joint with a gated local mixer")
+        if self.joint_local_mixer == "gmu_tanh_no_uz" and (
+                self.joint_local_kernel != "off" or self.joint_gate_normalization != "sigmoid"):
+            raise ValueError("gmu_tanh_no_uz requires joint_local_kernel='off' and sigmoid gates")
         if self.graph_update_mode == "baseline" and self.joint_local_mixer != "conv":
             raise ValueError("Gated local mixers are only supported in attention_joint")
         if min(self.hidden, self.graph_layers, self.d_state, self.d_conv) < 1:
@@ -72,35 +73,39 @@ class ModelConfig:
             raise ValueError("Invalid window or dropout")
         if self.decoder_mode not in ("classifier", "llm"):
             raise ValueError("decoder_mode must be 'classifier' or 'llm'")
-        if self.fusion_mode in ("hypergraph_concat", "hypergraph_sum", "hypergraph_only_sum"):
-            raise ValueError("This is a retired causal-prefix hypergraph mode. Use its archived source "
-                             "to load old checkpoints; hypergraph_nodes is the new within-utterance "
-                             "mean node-update architecture and requires new training.")
         if self.fusion_mode not in FUSION_MODES:
             raise ValueError(f"fusion_mode must be one of {FUSION_MODES}")
-        if self.hypergraph_edges < 1:
-            raise ValueError("hypergraph_edges must be positive")
-        if not math.isfinite(self.hypergraph_fusion_temperature) or self.hypergraph_fusion_temperature <= 0:
-            raise ValueError("hypergraph_fusion_temperature must be finite and positive")
-        if self.hypergraph_fusion_temperature != 1.0 and self.fusion_mode != "hypergraph_fusion":
-            raise ValueError("hypergraph_fusion_temperature only applies to hypergraph_fusion")
-        if not isinstance(self.hypergraph_confidence, bool):
-            raise ValueError("hypergraph_confidence must be boolean")
-        if (not math.isfinite(self.hypergraph_confidence_aux_weight)
-                or self.hypergraph_confidence_aux_weight < 0):
-            raise ValueError("hypergraph_confidence_aux_weight must be finite and nonnegative")
-        if self.hypergraph_confidence:
-            if self.fusion_mode not in LEARNED_HYPERGRAPH_MODES:
-                raise ValueError("hypergraph_confidence requires hypergraph_nodes or hypergraph_fusion")
-            if self.hypergraph_confidence_aux_weight <= 0:
-                raise ValueError("Confidence heads require a positive auxiliary CE weight")
-        if self.fusion_mode in LEARNED_HYPERGRAPH_MODES and self.decoder_mode != "classifier":
-            raise ValueError("Learned hypergraph readouts currently support the classifier decoder only")
 
 
 def model_config_from_dict(values):
     """Load active configs and original baseline checkpoints without renaming weights."""
     values = dict(values)
+    # Retired runtime fields do not affect weights or recurrence. All restored
+    # models now use PyTorch without CRG checkpointing. Use archived source to
+    # reproduce historical fused-kernel execution exactly.
+    old_backend = values.pop('scan_backend', 'reference')
+    if old_backend not in ('auto', 'cuda', 'reference'):
+        raise ValueError('Unrecognized historical scan backend')
+    old_checkpoint = values.pop('attention_checkpoint', False)
+    if not isinstance(old_checkpoint, bool):
+        raise ValueError('Historical attention_checkpoint must be boolean')
+    # Adjacent is always enabled. Never reinterpret the retired ablation as
+    # the retained architecture when restoring a historical checkpoint.
+    if values.pop('attention_adjacent', True) is not True:
+        raise ValueError('The no-Adjacent ablation is retired; load its archived source.')
+    # Old CRG-only checkpoints contain unused fields. Accept those configs, but
+    # never reinterpret a trained removed architecture as plain CRG.
+    if values.get('input_hypergraph', False) or values.get('hypergraph_confidence', False):
+        raise ValueError('This checkpoint uses a removed HG architecture; load its archived source.')
+    for field in ('input_hypergraph', 'input_hypergraph_layout', 'input_hypergraph_edges',
+                  'hypergraph_edges', 'hypergraph_fusion_temperature',
+                  'hypergraph_confidence', 'hypergraph_confidence_aux_weight'):
+        values.pop(field, None)
+    # Accept the retired flag only for checkpoints using the retained behavior.
+    relation_placement = values.pop("attention_relation_embedding", "group")
+    if relation_placement != "group":
+        raise ValueError("Source relation embedding is retired. Use the archived source "
+                         "to load its checkpoint; current CRG adds relation embeddings after pooling.")
     # New models always use d_inner=hidden. Accept old width-preserving configs,
     # but never silently load an expanded checkpoint as a different architecture.
     legacy_expand = values.pop("expand", 1)
@@ -111,6 +116,7 @@ def model_config_from_dict(values):
     values.setdefault("attention_adjacent_source", "input")
     # Before explicit mean pooling, pooled roles used sum(alpha * value).
     values.setdefault("attention_pool_reduction", "sum")
+    values.setdefault("attention_score", "dot_product")
     values.setdefault("joint_local_mixer", "conv")
     values.setdefault("joint_gate_normalization", "sigmoid")
     values.setdefault("joint_local_kernel", "on")
@@ -120,9 +126,8 @@ def model_config_from_dict(values):
                          "Use its archived source; pooled_roles_v1 requires a new trained checkpoint.")
     # A checkpoint written before fusion has no fusion weights and used plain sum.
     values.setdefault("fusion_mode", "sum")
-    if values["fusion_mode"] == "confidence_hyperedge":
-        raise ValueError("This checkpoint uses retired confidence fusion. Use its archived source; "
-                         "it cannot be reinterpreted as the new private/shared hyperedge fusion.")
+    if values['fusion_mode'] not in FUSION_MODES:
+        raise ValueError('This checkpoint uses a removed readout; load its archived source.')
     # Sum checkpoints may carry the former, unused confidence-fusion defaults.
     if values["fusion_mode"] == "sum":
         for field in ("fusion_aux_weight", "fusion_alpha_init", "fusion_beta_init"):

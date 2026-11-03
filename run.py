@@ -1,5 +1,6 @@
 """Train CRG-3: best validation when enabled; valid_ratio=0 uses train/test and best test."""
 import argparse
+import hashlib
 import json
 import random
 import time
@@ -12,8 +13,7 @@ import torch.nn.functional as F
 from sklearn.metrics import accuracy_score, f1_score
 from torch.utils.data import DataLoader, Subset, SubsetRandomSampler
 
-from CRG3.config import (ModelConfig, GRAPH_UPDATE_MODES, FUSION_MODES,
-                         LEARNED_HYPERGRAPH_MODES, model_config_from_dict)
+from CRG3.config import ModelConfig, GRAPH_UPDATE_MODES, FUSION_MODES, model_config_from_dict
 from CRG3.data import (Collator, GraphSmileDataset, NUM_CLASSES, to_device,
                        split_train_validation, session_id)
 from CRG3.model import CRG3, build_model
@@ -36,8 +36,8 @@ def parse_args(argv=None):
     parser.add_argument("--limit_dialogs", type=int, default=0, help="First N dialogues per split for a smoke run")
     parser.add_argument("--valid_ratio", type=float, default=0.1,
                         help="Fraction of official train dialogues reserved for validation; 0 disables validation")
-    parser.add_argument("--validation_split", choices=("ratio", "session"), default="ratio",
-                        help="ratio: first valid_ratio of train dialogue IDs; session: held-out IEMOCAP session")
+    parser.add_argument("--validation_split", choices=("ratio", "session", "native"), default="ratio",
+                        help="ratio: hold out train dialogue IDs; session: IEMOCAP session; native: official MELD dev")
     parser.add_argument("--validation_session", type=int, choices=(1, 2, 3, 4), default=1,
                         help="Held-out IEMOCAP session, used only with --validation_split session")
     parser.add_argument("--patience", type=int, default=0,
@@ -60,8 +60,10 @@ def parse_args(argv=None):
             options["choices"] = ("input", "updated")
         if name == "attention_pool_reduction":
             options["choices"] = ("sum", "mean")
+        if name == "attention_score":
+            options["choices"] = ("dot_product", "gat")
         if name == "joint_local_mixer":
-            options["choices"] = ("conv", "gated_silu", "gmu_tanh")
+            options["choices"] = ("conv", "gated_silu", "gmu_tanh", "gmu_tanh_no_uz")
         if name == "joint_gate_normalization":
             options["choices"] = ("sigmoid", "softmax")
         if name in ("graph_gate", "joint_local_kernel"):
@@ -91,6 +93,8 @@ def parse_args(argv=None):
         parser.error("valid_ratio must be in [0, 1)")
     if args.validation_split == "session" and args.dataset not in ("IEMOCAP", "IEMOCAP4"):
         parser.error("session validation is only supported for IEMOCAP")
+    if args.validation_split == "native" and args.dataset != "MELD":
+        parser.error("native validation is only supported for MELD")
     if args.patience < 0 or args.min_epochs < 1:
         parser.error("patience must be nonnegative and min_epochs positive")
     if args.lr_patience < 0 or not 0 < args.lr_factor < 1 or args.min_lr <= 0:
@@ -143,9 +147,49 @@ def get_IEMOCAP_loaders(batch_size=32, valid=0.1, num_workers=0, pin_memory=Fals
 def get_MELD_loaders(batch_size=32, valid=0.1, num_workers=0, pin_memory=False,
                      data_path=None, local_window=20, limit_dialogs=0, validation_session=1,
                      validation_split="ratio"):
+    if validation_split == "native":
+        return get_MELD_native_loaders(batch_size, valid, num_workers, pin_memory,
+                                      data_path, local_window, limit_dialogs)
     return get_IEMOCAP_loaders(batch_size, valid, num_workers, pin_memory,
                               data_path, local_window, limit_dialogs, "MELD", validation_session,
                               validation_split)
+
+
+def get_MELD_native_loaders(batch_size=16, valid=0.1, num_workers=0, pin_memory=False,
+                            data_path=None, local_window=10, limit_dialogs=0):
+    """Official MELD train/dev/test. valid=0 merges train+dev and disables dev."""
+    if not 0 <= valid < 1:
+        raise ValueError("valid must be in [0,1)")
+    native = json.loads((Path(__file__).parent / 'meld_native_split.json').read_text())
+    with Path(data_path).open('rb') as handle:
+        digest = hashlib.file_digest(handle, 'sha256').hexdigest()
+    if digest != native['dataset_sha256']:
+        raise ValueError("Native MELD manifest does not match this feature pickle")
+    trainset = GraphSmileDataset(data_path, 'MELD', 'train')
+    testset = GraphSmileDataset(data_path, 'MELD', 'test')
+    groups = {phase: list(map(str, native[source]['ids']))
+              for phase, source in [('train', 'train'), ('validation', 'dev'), ('test', 'test')]}
+    if set(groups['train']) & set(groups['validation']) or (set(groups['train']) | set(groups['validation'])) & set(groups['test']):
+        raise ValueError('Native MELD partitions overlap')
+    if set(map(str, trainset.keys)) != set(groups['train']) | set(groups['validation']) or set(map(str, testset.keys)) != set(groups['test']):
+        raise ValueError('Native MELD dialogue IDs differ from the feature pickle')
+    if trainset.feature_dims != testset.feature_dims:
+        raise ValueError('MELD train/test feature dimensions differ')
+    if valid == 0:
+        groups['train'] = sorted(groups['train'] + groups['validation'], key=int)
+        groups['validation'] = []
+    lookup = {str(k): i for i, k in enumerate(trainset.keys)}
+    test_lookup = {str(k): i for i, k in enumerate(testset.keys)}
+    train_ids = [lookup[k] for k in groups['train']]
+    val_ids = [lookup[k] for k in groups['validation']]
+    test_ids = [test_lookup[k] for k in groups['test']]
+    if limit_dialogs:
+        train_ids, val_ids, test_ids = (ids[:limit_dialogs] for ids in (train_ids, val_ids, test_ids))
+    options = dict(batch_size=batch_size, collate_fn=Collator(local_window),
+                   num_workers=num_workers, pin_memory=pin_memory)
+    return (DataLoader(trainset, sampler=SubsetRandomSampler(train_ids), **options),
+            DataLoader(Subset(trainset, val_ids), **options) if val_ids else None,
+            DataLoader(Subset(testset, test_ids), **options))
 
 
 def get_class_weights(train_loader, num_classes, device, weighting="none"):
@@ -174,19 +218,7 @@ def train_or_eval_graph_model(model, loss_function, dataloader, epoch, device,
     else:
         model.eval()
     loss_sum, loss_denominator, n_utterances = 0.0, 0.0, 0
-    shared_norm_sum = 0.0
-    modality_sum = torch.zeros(3, dtype=torch.float64)
     core = model.module if isinstance(model, torch.nn.DataParallel) else model
-    use_fusion = core.cfg.fusion_mode == "hyperedge"
-    use_hypergraph = core.cfg.fusion_mode in LEARNED_HYPERGRAPH_MODES
-    use_edge_fusion = core.cfg.fusion_mode == "hypergraph_fusion"
-    use_confidence = core.cfg.hypergraph_confidence
-    main_loss_sum = aux_loss_sum = 0.0
-    confidence_sum = torch.zeros(3, dtype=torch.float64)
-    confidence_correct = torch.zeros(3, dtype=torch.float64)
-    edge_sum = torch.zeros(core.cfg.hypergraph_edges, dtype=torch.float64) if use_hypergraph else None
-    beta_sum = torch.zeros(core.cfg.hypergraph_edges, dtype=torch.float64) if use_edge_fusion else None
-    hypergraph_norm_sum = 0.0
     labels, preds = [], []
 
     with torch.set_grad_enabled(train):
@@ -196,7 +228,7 @@ def train_or_eval_graph_model(model, loss_function, dataloader, epoch, device,
                 optimizer.zero_grad(set_to_none=True)
 
             with autocast():
-                output = model(batch, return_aux=True) if (use_fusion or use_hypergraph) else {"logits": model(batch)}
+                output = {"logits": model(batch)}
                 logits = output["logits"]
                 mask = batch["mask"]
                 losses = core.classification_losses(output, batch["label"], mask, loss_function)
@@ -209,21 +241,6 @@ def train_or_eval_graph_model(model, loss_function, dataloader, epoch, device,
             batch_denominator = (float(class_weights[batch["label"][mask]].sum().item())
                                  if class_weights is not None else count)
             loss_sum += float(loss.item()) * batch_denominator
-            if use_confidence:
-                main_loss_sum += float(losses["classification_loss"].item()) * batch_denominator
-                aux_loss_sum += float(losses["confidence_aux_loss"].item()) * batch_denominator
-                confidence_sum += output["hypergraph_confidence"][mask].detach().double().sum(0).cpu()
-                confidence_correct += (output["hypergraph_confidence_logits"][mask].detach().argmax(-1)
-                                       == batch["label"][mask].unsqueeze(-1)).double().sum(0).cpu()
-            if use_fusion:
-                shared_norm_sum += float(output["shared_update"][mask].detach().float().norm(dim=-1).sum())
-                modality_sum += output["modality_weights"][mask].detach().double().sum(0).cpu()
-            if use_hypergraph:
-                edge_sum += output["hypergraph_membership"][mask].detach().double().sum((0, 1)).cpu()
-                value = output["hypergraph_fused"] if use_edge_fusion else output["hypergraph_raw"]
-                hypergraph_norm_sum += float(value[mask].detach().float().norm(dim=-1).sum())
-                if use_edge_fusion:
-                    beta_sum += output["hypergraph_attention"][mask].detach().double().sum(0).cpu()
             loss_denominator += batch_denominator
             n_utterances += count
 
@@ -239,23 +256,6 @@ def train_or_eval_graph_model(model, loss_function, dataloader, epoch, device,
             "weighted_f1": 100 * f1_score(labels, preds, average="weighted", zero_division=0),
             "macro_f1": 100 * f1_score(labels, preds, average="macro", zero_division=0),
             "n_utterances": n_utterances}
-    if use_fusion:
-        metrics.update(mean_shared_update_norm=shared_norm_sum / n_utterances,
-                       mean_modality_weights=dict(zip(("t", "a", "v"), (modality_sum / n_utterances).tolist())))
-    if use_hypergraph:
-        metrics.update(mean_hyperedge_membership=(edge_sum / (3 * n_utterances)).tolist())
-        if use_edge_fusion:
-            metrics.update(mean_hyperedge_attention=(beta_sum / n_utterances).tolist(),
-                           mean_hypergraph_fused_norm=hypergraph_norm_sum / n_utterances)
-        else:
-            metrics.update(mean_hypergraph_raw_norm=hypergraph_norm_sum / (3 * n_utterances))
-    if use_confidence:
-        metrics.update(classification_loss=main_loss_sum / loss_denominator,
-                       confidence_aux_loss=aux_loss_sum / loss_denominator,
-                       mean_modality_confidence=dict(zip(("t", "a", "v"),
-                           (confidence_sum / n_utterances).tolist())),
-                       confidence_head_accuracy=dict(zip(("t", "a", "v"),
-                           (100 * confidence_correct / n_utterances).tolist())))
     return metrics
 
 
@@ -331,6 +331,7 @@ def main(argv=None):
               "early_stopping_active": bool(args.patience and has_validation),
               "epochs": history}
     print(f"CRG3 | {args.dataset} | {cfg.graph_update_mode} | fusion={cfg.fusion_mode} | device={device} | "
+          "scan=PyTorch | "
           f"train={split_sizes[0]} val={split_sizes[1]} test={split_sizes[2]} | selection={selection}", flush=True)
     def synchronize():
         if device.type == "cuda":

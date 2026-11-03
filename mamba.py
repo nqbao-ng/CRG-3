@@ -1,21 +1,9 @@
-"""Mamba with fused CUDA selective scan and an equivalent CPU/reference path.
-
-CUDA requires mamba_ssm: fail explicitly rather than silently use the high-memory path.
-Projection, convolution and recurrence are shared by both RMSNorm ablations.
-"""
+"""Selective SSM computed directly in PyTorch on CPU/GPU; no external Mamba kernel."""
 import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-try:
-    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
-    SCAN_IMPORT_ERROR = None
-except (ImportError, OSError) as exc:
-    selective_scan_fn = None
-    SCAN_IMPORT_ERROR = str(exc)
-
 
 class RMSNorm(nn.Module):
     def __init__(self, d, eps=1e-5):
@@ -38,7 +26,6 @@ class MambaMixer(nn.Module):
         super().__init__()
         d_inner = d_model  # width-preserving: no expansion hyperparameter
         self.d_inner, self.d_state = d_inner, d_state
-        self.scan_backend = "auto"  # reference is only for CPU checks/parity tests
         self.dt_rank = math.ceil(d_model / 16)
         self.in_proj = nn.Linear(d_model, 2 * d_inner, bias=False)
         self.out_proj = nn.Linear(d_inner, d_model, bias=False)
@@ -73,19 +60,6 @@ class MambaMixer(nn.Module):
             dt, Bm, Cm = self.x_proj(u).split([self.dt_rank, self.d_state, self.d_state], dim=-1)
             dt = F.softplus(self.dt_proj(dt))                            # [b, L, d_inner]
             A = -torch.exp(self.A_log.float())                           # [d_inner, n]
-            if self.scan_backend not in ("auto", "cuda", "reference"):
-                raise ValueError(f"Unknown scan backend: {self.scan_backend}")
-            use_cuda = self.scan_backend == "cuda" or (u.is_cuda and self.scan_backend == "auto")
-            if use_cuda:
-                if not u.is_cuda or selective_scan_fn is None:
-                    raise RuntimeError(f"CUDA selective scan requires working mamba_ssm. {SCAN_IMPORT_ERROR}")
-                # dt already includes the bias AND softplus: do not apply either twice.
-                y = selective_scan_fn(
-                    u.transpose(1, 2).contiguous(), dt.transpose(1, 2).contiguous(), A,
-                    Bm.transpose(1, 2).contiguous(), Cm.transpose(1, 2).contiguous(),
-                    self.D.float(), z=None, delta_bias=None, delta_softplus=False,
-                    return_last_state=False)
-                return y.transpose(1, 2).to(dtype)
             dA = torch.exp(dt.unsqueeze(-1) * A)                         # [b, L, d_inner, n]
             dBu = dt.unsqueeze(-1) * Bm.unsqueeze(2) * u.unsqueeze(-1)   # [b, L, d_inner, n]
             h = u.new_zeros(u.shape[0], self.d_inner, self.d_state)
@@ -100,7 +74,7 @@ class MambaMixer(nn.Module):
 class SelectiveStateSpace(nn.Module):
     """Selective SSM for transformed inputs, with no local convolution.
 
-    Reuses the exact CUDA/reference recurrence of MambaMixer. Input projection,
+    Reuses the same PyTorch recurrence as MambaMixer. Input projection,
     local interaction, output gating and projection are owned by the caller.
     """
 
@@ -109,7 +83,6 @@ class SelectiveStateSpace(nn.Module):
         super().__init__()
         self.d_inner, self.d_state = d_model, d_state
         self.dt_rank = math.ceil(d_model / 16)
-        self.scan_backend = "auto"
         self.x_proj = nn.Linear(self.d_inner, self.dt_rank + 2 * d_state, bias=False)
         self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
         nn.init.uniform_(self.dt_proj.weight, -self.dt_rank ** -0.5, self.dt_rank ** -0.5)
@@ -135,3 +108,5 @@ class MambaBlock(nn.Module):
 
     def forward(self, x):
         return x + self.mixer(self.norm(x))
+
+

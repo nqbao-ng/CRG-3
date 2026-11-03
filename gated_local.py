@@ -98,3 +98,38 @@ class GatedRoleMambaBlock(nn.Module):
 
     def forward(self, x):
         return x + self.mixer(self.norm(x))
+
+
+class DirectGatedRoleSSMMixer(GatedRoleMambaMixer):
+    """RMS-normalized roles -> sigmoid/tanh local mixing -> selective SSM.
+
+    No u/z projection and no post-scan SiLU(z) gate. The inherited constructor
+    initializes common parameters identically to the old no-kernel tanh control;
+    in_proj is then removed, so it has no runtime work, weights or optimizer state.
+    This is an SSM adaptation, not the canonical Mamba block.
+    """
+    def __init__(self, d_model, d_state=16, d_conv=4):
+        super().__init__(d_model, d_state, d_conv, mode="gmu_tanh",
+                         gate_normalization="sigmoid", use_kernel=False)
+        del self.in_proj
+
+    def forward(self, x, read_position=None):
+        y = self.selective_scan(self.local(x))
+        if read_position is not None:
+            # All causal role states are needed; only the target is read out.
+            y = y[torch.arange(y.shape[0], device=y.device), read_position]
+        return self.out_proj(y)
+
+
+class DirectGatedRoleSSMBlock(nn.Module):
+    """Keep pre-norm and residual; optionally project only the target output."""
+    def __init__(self, d_model, d_state=16, d_conv=4):
+        super().__init__()
+        self.norm = RMSNorm(d_model)
+        self.mixer = DirectGatedRoleSSMMixer(d_model, d_state, d_conv)
+
+    def forward(self, x, read_position=None):
+        residual = x
+        if read_position is not None:
+            residual = x[torch.arange(x.shape[0], device=x.device), read_position]
+        return residual + self.mixer(self.norm(x), read_position)

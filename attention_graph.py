@@ -15,22 +15,27 @@ import math
 
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import checkpoint
+import torch.nn.functional as F
 
 from .graph import MODALITIES, GateUpdate
 from .mamba import MambaBlock
-from .gated_local import GatedRoleMambaBlock
+from .gated_local import GatedRoleMambaBlock, DirectGatedRoleSSMBlock
 from .adjacency import (adjacency_from_neighbors, build_speaker_adjacency,
                         mask_dense_adjacency)
 
 
-def attention_messages(query, keys, values, mask, normalization="joint"):
+def attention_messages(query, keys, values, mask, normalization="joint", *, scores=None):
     """[rows,d], [rows,K,3,d], [rows,K] -> messages [rows,K,d], effective weights.
 
     Empty rows have exactly zero weights and finite gradients. Effective weights
     sum to one across K*3 (zero for empty rows).
     """
-    scores = (query[:, None, None].float() * keys.float()).sum(-1) / math.sqrt(query.shape[-1])
+    if scores is None:
+        scores = (query[:, None, None].float() * keys.float()).sum(-1) / math.sqrt(query.shape[-1])
+    elif scores.shape != keys.shape[:-1]:
+        raise ValueError('Precomputed attention scores must match [rows, sources, modalities]')
+    else:
+        scores = scores.float()
     expanded_mask = mask.unsqueeze(-1).expand_as(scores)
     scores = scores.masked_fill(~expanded_mask, -torch.inf)
     scores = torch.where(mask.any(-1)[:, None, None], scores, torch.zeros_like(scores))
@@ -44,14 +49,17 @@ def attention_messages(query, keys, values, mask, normalization="joint"):
 
 
 
-def attention_pool(query, keys, values, mask, reduction="mean"):
+def attention_pool(query, keys, values, mask, reduction="mean", *, scores=None):
     """Pool alpha*v; mean divides by valid source count, excluding padding.
 
     Softmax still sums to one before this reduction. Thus mean is the old
     attention sum scaled by 1/(valid utterances * source modalities).
     Empty groups remain zero. sum preserves historical checkpoint behavior.
     """
-    messages, weights = attention_messages(query, keys, values, mask)
+    if scores is None:
+        messages, weights = attention_messages(query, keys, values, mask)
+    else:
+        messages, weights = attention_messages(query, keys, values, mask, scores=scores)
     pooled = messages.sum(dim=1)
     if reduction == "mean":
         count = (mask.sum(dim=1) * values.shape[2]).clamp_min(1)
@@ -59,6 +67,27 @@ def attention_pool(query, keys, values, mask, reduction="mean"):
     elif reduction != "sum":
         raise ValueError(f"Unknown attention pool reduction: {reduction}")
     return pooled, weights
+
+
+class AdditiveRelationScorer(nn.Module):
+    """GAT-style scoring on retained Q/K, without per-edge concatenation.
+
+    e = LeakyReLU(a_target^T Q_i + a_source^T K_j + a_relation^T e_R).
+    Value projection, graph structure, joint softmax and role pooling stay separate.
+    """
+    negative_slope = 0.2
+
+    def __init__(self, hidden):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(3, hidden))
+        nn.init.xavier_uniform_(self.weight)
+
+    def forward(self, query, keys, relation_embedding):
+        weight = self.weight.float()
+        target = (query.float() * weight[0]).sum(-1)[:, None, None]
+        source = (keys.float() * weight[1]).sum(-1)
+        relation = (relation_embedding.float() * weight[2]).sum()
+        return F.leaky_relu(target + source + relation, self.negative_slope)
 
 
 def pack_role_tokens(tokens, present):
@@ -89,9 +118,9 @@ class AttentionGraphLayer(nn.Module):
         d = cfg.hidden
         self.window = cfg.local_window
         self.chunk_size = cfg.attention_chunk_size
-        self.use_checkpoint = cfg.attention_checkpoint
         self.adjacent_source = cfg.attention_adjacent_source
         self.pool_reduction = cfg.attention_pool_reduction
+        self.attention_score = cfg.attention_score
         # Q/K/V projections are shared BETWEEN groups within this layer, while
         # each group has its own softmax denominator and role embedding.
         self.pre_norm = nn.ModuleDict({m: nn.LayerNorm(d) for m in MODALITIES})
@@ -107,6 +136,9 @@ class AttentionGraphLayer(nn.Module):
         if cfg.joint_local_mixer == "conv":
             self.scan = nn.ModuleDict({m: MambaBlock(d, cfg.d_state, cfg.d_conv,
                                                    use_rmsnorm=True) for m in MODALITIES})
+        elif cfg.joint_local_mixer == "gmu_tanh_no_uz":
+            self.scan = nn.ModuleDict({m: DirectGatedRoleSSMBlock(
+                d, cfg.d_state, cfg.d_conv) for m in MODALITIES})
         else:
             self.scan = nn.ModuleDict({m: GatedRoleMambaBlock(
                 d, cfg.d_state, cfg.d_conv, mode=cfg.joint_local_mixer,
@@ -119,12 +151,19 @@ class AttentionGraphLayer(nn.Module):
             # No unused gate parameters remain; W_c/dropout/residual are retained.
             for update in self.update.values():
                 update.gate = None
+        if self.attention_score == 'gat':
+            # Isolate new initialization so subsequent layers/classifier and
+            # common weights match a same-seed dot-product control.
+            with torch.random.fork_rng(devices=[]):
+                self.gat_scorer = nn.ModuleDict({m: AdditiveRelationScorer(d) for m in MODALITIES})
+            # Separate from the retained post-pooling relation embeddings.
+            self.score_relation_embedding = nn.ParameterDict({
+                r: nn.Parameter(torch.zeros(d)) for r in ('diff', 'same')})
 
     def _scan_rows(self, query, keys, values, target_rows, diff_mask, same_mask,
                    adjacent, adjacent_mask, read, modality):
         # target_rows are flattened B*N indices. Gather only the chronological
-        # interval [i-W, i), inside checkpoint so its K/V activations can be
-        # discarded and recomputed. No [rows,N,3,d] source copy is created.
+        # interval [i-W, i). No [rows,N,3,d] source copy is created.
         length = keys.shape[1]
         width = min(self.window, max(0, length - 1))
         dialogue_rows = torch.div(target_rows, length, rounding_mode='floor')
@@ -138,17 +177,29 @@ class AttentionGraphLayer(nn.Module):
         # not repeated edges to source0. Preserve any explicitly blocked edges.
         diff_mask = diff_mask.gather(1, source_indices) & present_sources
         same_mask = same_mask.gather(1, source_indices) & present_sources
-        diff, _ = attention_pool(query, source_keys, source_values, diff_mask,
-                                 self.pool_reduction)
-        same, _ = attention_pool(query, source_keys, source_values, same_mask,
-                                 self.pool_reduction)
+        if self.attention_score == 'gat':
+            diff_scores = self.gat_scorer[modality](
+                query, source_keys, self.score_relation_embedding['diff'])
+            same_scores = self.gat_scorer[modality](
+                query, source_keys, self.score_relation_embedding['same'])
+            diff_h, _ = attention_pool(query, source_keys, source_values, diff_mask,
+                                      self.pool_reduction, scores=diff_scores)
+            same_h, _ = attention_pool(query, source_keys, source_values, same_mask,
+                                      self.pool_reduction, scores=same_scores)
+        else:
+            diff_h, _ = attention_pool(query, source_keys, source_values, diff_mask,
+                                      self.pool_reduction)
+            same_h, _ = attention_pool(query, source_keys, source_values, same_mask,
+                                      self.pool_reduction)
         tokens = torch.stack([
-            diff + self.relation_embedding['diff'],
-            same + self.relation_embedding['same'],
+            diff_h + self.relation_embedding['diff'],
+            same_h + self.relation_embedding['same'],
             adjacent + self.adjacent_embedding, read], dim=1)
         present = torch.stack([diff_mask.any(-1), same_mask.any(-1), adjacent_mask,
                                torch.ones_like(adjacent_mask)], dim=1)
         sequence, read_position = pack_role_tokens(tokens, present)
+        if isinstance(self.scan[modality], DirectGatedRoleSSMBlock):
+            return self.scan[modality](sequence, read_position)
         output = self.scan[modality](sequence)
         return output[torch.arange(len(output), device=output.device), read_position]
 
@@ -178,10 +229,7 @@ class AttentionGraphLayer(nn.Module):
                 inputs = (queries[chunk], keys, values, chunk, diff_mask[chunk],
                           same_mask[chunk], adjacent[dialogue_rows],
                           adjacent_mask[chunk], read[chunk], modality)
-                if self.use_checkpoint and self.training and torch.is_grad_enabled():
-                    context = checkpoint(self._scan_rows, *inputs, use_reentrant=False)
-                else:
-                    context = self._scan_rows(*inputs)
+                context = self._scan_rows(*inputs)
                 chunks.append(context)
             context = H.new_zeros(B, d)
             if chunks:
@@ -225,10 +273,7 @@ class AttentionGraphLayer(nn.Module):
                 inputs = (queries[chunk], keys, values, chunk, diff_mask[chunk],
                           same_mask[chunk], adjacent[chunk],
                           adjacent_mask[chunk], read[chunk], m)
-                if self.use_checkpoint and self.training and torch.is_grad_enabled():
-                    context = checkpoint(self._scan_rows, *inputs, use_reentrant=False)
-                else:
-                    context = self._scan_rows(*inputs)
+                context = self._scan_rows(*inputs)
                 chunks.append(context)
             context = H[m].new_zeros(B * N, d)
             if chunks:

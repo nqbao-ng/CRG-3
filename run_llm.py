@@ -16,7 +16,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from .config import LLMConfig, ModelConfig, LEARNED_HYPERGRAPH_MODES, model_config_from_dict
+from .config import LLMConfig, ModelConfig, model_config_from_dict
 from .data import (Collator, GraphSmileDataset, NUM_CLASSES, to_device,
                    split_train_validation, session_id)
 from .model import CRG3
@@ -76,8 +76,6 @@ def prepare_cache(args):
     cfg = model_config_from_dict(raw_cfg)
     if cfg.decoder_mode != "classifier":
         raise ValueError("prepare expects an existing classifier graph checkpoint")
-    if cfg.fusion_mode in LEARNED_HYPERGRAPH_MODES:
-        raise ValueError("Learned hypergraph readouts currently support classifier experiments, not this LLM cache")
     if checkpoint.get("dataset", args.dataset) != args.dataset:
         raise ValueError("Graph checkpoint and requested dataset differ")
     trainset = GraphSmileDataset(args.data_path, args.dataset, "train", include_transcript=True,

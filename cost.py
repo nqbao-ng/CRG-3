@@ -13,7 +13,6 @@ import torch.nn as nn
 from . import attention_graph
 from .mamba import MambaMixer, SelectiveStateSpace
 from .gated_local import GatedLocalConv
-from .hypergraph import UtteranceHypergraph, UtteranceHypergraphFusion
 
 
 class ForwardCost:
@@ -57,27 +56,14 @@ class ForwardCost:
         self.counts['gated_local_flops'] += (6 if module.kernel is None else 7) * slots
         self.counts['gated_local_calls'] += 1
 
-    def hypergraph(self, module, inputs, output):
-        contextual, valid = inputs
-        batch, length = valid.shape
-        modalities, hidden, edges = len(contextual), module.hidden, module.num_hyperedges
-        # Routing Linear layers are counted by their own hooks. Count anchor
-        # scores (+scale), writes, degree mean and reads here, including
-        # padded slots that vectorized kernels really compute. Norm/softmax excluded.
-        scores = batch * length * modalities * edges * (2 * hidden)
-        writes = batch * length * edges * hidden * (2 * modalities - 1)
-        # Sum M incidence weights, add epsilon, then divide each of H channels.
-        mean = batch * length * edges * (modalities + hidden)
-        # Fusion's score Linear layers are counted by their own hooks. It
-        # pools K edges once, rather than reading them back to M nodes.
-        receivers = 1 if isinstance(module, UtteranceHypergraphFusion) else modalities
-        reads = batch * length * receivers * hidden * (2 * edges - 1)
-        self.counts['hypergraph_flops'] += scores + writes + mean + reads
-        if module.confidence_heads is not None:
-            # A=P*c; normalized source weights returned for diagnostics. Head
-            # Linear FLOPs use regular hooks; softmax/max/detach are excluded.
-            self.counts['hypergraph_flops'] += batch * length * edges * (2 * modalities + 1)
-        self.counts['hypergraph_calls'] += 1
+    def additive_score(self, module, inputs, output):
+        rows, width, modalities, hidden = inputs[1].shape
+        # Three scalar dot-product terms, then two additions per edge.
+        # LeakyReLU stays excluded, as for other activations.
+        self.counts['attention_flops'] += (
+            (rows + rows * width * modalities + 1) * (2 * hidden - 1)
+            + 2 * rows * width * modalities)
+        self.counts['gat_score_calls'] += 1
 
     def __enter__(self):
         for module in self.model.modules():
@@ -89,30 +75,30 @@ class ForwardCost:
                 self.handles.append(module.register_forward_hook(self.scan))
             elif isinstance(module, GatedLocalConv):
                 self.handles.append(module.register_forward_hook(self.gated_local))
-            elif isinstance(module, UtteranceHypergraph):
-                self.handles.append(module.register_forward_hook(self.hypergraph))
+            elif isinstance(module, attention_graph.AdditiveRelationScorer):
+                self.handles.append(module.register_forward_hook(self.additive_score))
         self.original_attention = attention_graph.attention_messages
 
-        def counted_attention(query, keys, values, mask, normalization='joint'):
+        def counted_attention(query, keys, values, mask, normalization='joint', *, scores=None):
             rows, width, modalities, hidden = keys.shape
             # Dot product (2H-1) plus scale (1); weighted values and their sum.
             self.counts['attention_flops'] += (
-                rows * width * modalities * 2 * hidden
+                (rows * width * modalities * 2 * hidden if scores is None else 0)
                 + rows * width * hidden * (2 * modalities - 1))
             self.counts['attention_calls'] += 1
-            return self.original_attention(query, keys, values, mask, normalization)
+            return self.original_attention(query, keys, values, mask, normalization, scores=scores)
 
         attention_graph.attention_messages = counted_attention
         self.original_pool = attention_graph.attention_pool
 
-        def counted_pool(query, keys, values, mask, reduction='mean'):
+        def counted_pool(query, keys, values, mask, reduction='mean', *, scores=None):
             # attention_messages counts modality reduction; pooling also reduces time.
             rows, width, _, hidden = keys.shape
             self.counts['attention_flops'] += rows * hidden * max(0, width - 1)
             if reduction == 'mean':
                 self.counts['attention_flops'] += rows * hidden  # divide pooled vector by valid count
             self.counts['attention_pool_calls'] += 1
-            return self.original_pool(query, keys, values, mask, reduction)
+            return self.original_pool(query, keys, values, mask, reduction, scores=scores)
 
         attention_graph.attention_pool = counted_pool
         self.original_adjacent = attention_graph.dense_adjacent_features
@@ -136,6 +122,6 @@ class ForwardCost:
         result = dict(self.counts)
         result['total_major_arithmetic_flops'] = sum(self.counts[k] for k in (
             'linear_flops', 'conv1d_flops', 'attention_flops', 'scan_arithmetic_flops',
-            'gated_local_flops', 'adjacency_flops', 'hypergraph_flops'))
+            'gated_local_flops', 'adjacency_flops'))
         result['gflops'] = result['total_major_arithmetic_flops'] / 1e9
         return result
