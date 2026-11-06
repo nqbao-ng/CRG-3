@@ -13,7 +13,9 @@ import torch.nn.functional as F
 from sklearn.metrics import accuracy_score, f1_score
 from torch.utils.data import DataLoader, Subset, SubsetRandomSampler
 
-from CRG3.config import ModelConfig, GRAPH_UPDATE_MODES, FUSION_MODES, model_config_from_dict
+from CRG3.config import (ModelConfig, GRAPH_UPDATE_MODES, FUSION_MODES,
+                         ATTENTION_HISTORY_SCOPES, JOINT_SSM_FUSION_MODES,
+                         ROLE_SCAN_MODES, model_config_from_dict)
 from CRG3.data import (Collator, GraphSmileDataset, NUM_CLASSES, to_device,
                        split_train_validation, session_id)
 from CRG3.model import CRG3, build_model
@@ -59,15 +61,23 @@ def parse_args(argv=None):
         if name == "attention_adjacent_source":
             options["choices"] = ("input", "updated")
         if name == "attention_pool_reduction":
-            options["choices"] = ("sum", "mean")
+            options["choices"] = ("sum", "mean", "modality_mean")
         if name == "attention_score":
             options["choices"] = ("dot_product", "gat")
+        if name == "attention_history_scope":
+            options["choices"] = ATTENTION_HISTORY_SCOPES
+        if name == "joint_ssm_fusion":
+            options["choices"] = JOINT_SSM_FUSION_MODES
+        if name == "role_scan_mode":
+            options["choices"] = ROLE_SCAN_MODES
         if name == "joint_local_mixer":
-            options["choices"] = ("conv", "gated_silu", "gmu_tanh", "gmu_tanh_no_uz")
+            options["choices"] = ("gmu_tanh_no_uz",)
         if name == "joint_gate_normalization":
-            options["choices"] = ("sigmoid", "softmax")
-        if name in ("graph_gate", "joint_local_kernel"):
+            options["choices"] = ("sigmoid",)
+        if name == "graph_gate":
             options["choices"] = ("on", "off")
+        if name == "joint_local_kernel":
+            options["choices"] = ("off",)
         if name in ("model_type", "message_mode", "graph_rmsnorm"):
             options["choices"] = (field.default,)
         if isinstance(field.default, bool):

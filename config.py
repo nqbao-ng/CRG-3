@@ -1,8 +1,11 @@
 from dataclasses import dataclass
 
 
-GRAPH_UPDATE_MODES = ("baseline", "attention_joint")
+GRAPH_UPDATE_MODES = ("attention_joint",)
 FUSION_MODES = ("sum", "concat")
+JOINT_SSM_FUSION_MODES = ("off", "gated")
+ATTENTION_HISTORY_SCOPES = ("joint", "intra")
+ROLE_SCAN_MODES = ("forward", "sequential", "cagmamba")
 
 
 @dataclass
@@ -16,18 +19,21 @@ class ModelConfig:
     dropout: float = 0.2
     message_mode: str = "embedding"  # retained in checkpoint schema; fixed in active experiments
     graph_rmsnorm: str = "on"
-    graph_update_mode: str = "baseline"  # see GRAPH_UPDATE_MODES
-    graph_gate: str = "on"  # off: joint only, retain context projection/dropout/residual
+    graph_update_mode: str = "attention_joint"  # see GRAPH_UPDATE_MODES
+    graph_gate: str = "on"  # off: retain context projection/dropout/residual
     attention_chunk_size: int = 64  # target rows processed together, per modality
     attention_layout: str = "pooled_roles_v1"  # Diff/Same pooling -> Adjacent -> Target
     attention_adjacent_source: str = "updated"  # input: A, updated: recurrent B
-    attention_pool_reduction: str = "mean"  # arithmetic mean after weighting
+    attention_pool_reduction: str = "mean"  # legacy mean | joint sum | modality_mean (separate softmax + mean)
     attention_score: str = "dot_product"  # dot_product | gat (additive scorer only)
-    joint_local_mixer: str = "conv"  # conv | gated_silu | gmu_tanh | gmu_tanh_no_uz
-    joint_gate_normalization: str = "sigmoid"  # same scalar gates for both variants
-    joint_local_kernel: str = "on"  # off: gated_silu/gmu_tanh without the learned k_l
+    joint_local_mixer: str = "gmu_tanh_no_uz"  # fixed kernel-free tanh SSM, no u/z
+    joint_gate_normalization: str = "sigmoid"  # fixed scalar local gates
+    joint_local_kernel: str = "off"  # fixed: no learned lag kernel
+    joint_ssm_fusion: str = "off"  # off | gated; gated_concat is retained for checkpoint loading
     fusion_mode: str = "sum"  # sum: Linear(H,C); concat(T,A,V): Linear(3H,C)
     decoder_mode: str = "classifier"  # classifier | llm
+    attention_history_scope: str = "joint"  # joint T/A/V or intra-modality Same/Diff sources
+    role_scan_mode: str = "forward"  # forward | sequential | cagmamba
 
     def __post_init__(self):
         if self.model_type != "crg3":
@@ -38,35 +44,28 @@ class ModelConfig:
             raise ValueError("Active experiments keep embedding messages and RMSNorm on")
         if self.graph_gate not in ("on", "off"):
             raise ValueError("graph_gate must be on or off")
-        if self.graph_gate == "off" and self.graph_update_mode != "attention_joint":
-            raise ValueError("GateUpdate ablation is only supported in attention_joint; baseline stays unchanged")
         if self.attention_chunk_size < 1:
             raise ValueError("attention_chunk_size must be positive")
         if self.attention_layout != "pooled_roles_v1":
             raise ValueError("Only attention_layout='pooled_roles_v1' is supported")
         if self.attention_adjacent_source not in ("input", "updated"):
             raise ValueError("attention_adjacent_source must be 'input' or 'updated'")
-        if self.attention_pool_reduction not in ("sum", "mean"):
-            raise ValueError("attention_pool_reduction must be 'sum' or 'mean'")
+        if self.attention_pool_reduction not in ("sum", "mean", "modality_mean"):
+            raise ValueError("attention_pool_reduction must be 'sum', 'mean' or 'modality_mean'")
         if self.attention_score not in ("dot_product", "gat"):
             raise ValueError("attention_score must be 'dot_product' or 'gat'")
-        if self.attention_score == "gat" and self.graph_update_mode != "attention_joint":
-            raise ValueError("GAT attention scoring is only supported in attention_joint")
-        if self.joint_local_mixer not in ("conv", "gated_silu", "gmu_tanh", "gmu_tanh_no_uz"):
-            raise ValueError("joint_local_mixer must be conv, gated_silu, gmu_tanh or gmu_tanh_no_uz")
-        if self.joint_gate_normalization not in ("sigmoid", "softmax"):
-            raise ValueError("joint_gate_normalization must be sigmoid or softmax")
-        if self.joint_local_kernel not in ("on", "off"):
-            raise ValueError("joint_local_kernel must be on or off")
-        if self.joint_local_kernel == "off" and (
-                self.graph_update_mode != "attention_joint"
-                or self.joint_local_mixer not in ("gated_silu", "gmu_tanh", "gmu_tanh_no_uz")):
-            raise ValueError("Kernel ablation requires attention_joint with a gated local mixer")
-        if self.joint_local_mixer == "gmu_tanh_no_uz" and (
-                self.joint_local_kernel != "off" or self.joint_gate_normalization != "sigmoid"):
-            raise ValueError("gmu_tanh_no_uz requires joint_local_kernel='off' and sigmoid gates")
-        if self.graph_update_mode == "baseline" and self.joint_local_mixer != "conv":
-            raise ValueError("Gated local mixers are only supported in attention_joint")
+        if self.joint_ssm_fusion not in (*JOINT_SSM_FUSION_MODES, 'gated_concat'):
+            raise ValueError(f"joint_ssm_fusion must be one of {JOINT_SSM_FUSION_MODES}")
+        if self.attention_history_scope not in ATTENTION_HISTORY_SCOPES:
+            raise ValueError(f"attention_history_scope must be one of {ATTENTION_HISTORY_SCOPES}")
+        if self.role_scan_mode not in ROLE_SCAN_MODES:
+            raise ValueError(f"role_scan_mode must be one of {ROLE_SCAN_MODES}")
+        if self.role_scan_mode != "forward" and self.joint_ssm_fusion != "off":
+            raise ValueError("Bidirectional role scans require joint_ssm_fusion='off'")
+        if self.joint_local_mixer != "gmu_tanh_no_uz":
+            raise ValueError("Only gmu_tanh_no_uz is retained; use archived source for u/z models")
+        if self.joint_local_kernel != "off" or self.joint_gate_normalization != "sigmoid":
+            raise ValueError("The retained mixer requires no learned kernel and sigmoid local gates")
         if min(self.hidden, self.graph_layers, self.d_state, self.d_conv) < 1:
             raise ValueError("Model dimensions and graph_layers must be positive")
         if self.local_window < 0 or not 0 <= self.dropout < 1:
@@ -78,7 +77,7 @@ class ModelConfig:
 
 
 def model_config_from_dict(values):
-    """Load active configs and original baseline checkpoints without renaming weights."""
+    """Load retained no-u/z checkpoints without reinterpreting retired architectures."""
     values = dict(values)
     # Retired runtime fields do not affect weights or recurrence. All restored
     # models now use PyTorch without CRG checkpointing. Use archived source to
@@ -106,6 +105,9 @@ def model_config_from_dict(values):
     if relation_placement != "group":
         raise ValueError("Source relation embedding is retired. Use the archived source "
                          "to load its checkpoint; current CRG adds relation embeddings after pooling.")
+    if (values.get('graph_update_mode', 'baseline') != 'attention_joint'
+            or values.get('joint_local_mixer', 'conv') != 'gmu_tanh_no_uz'):
+        raise ValueError('This checkpoint uses a retired u/z architecture; load its archived source.')
     # New models always use d_inner=hidden. Accept old width-preserving configs,
     # but never silently load an expanded checkpoint as a different architecture.
     legacy_expand = values.pop("expand", 1)
@@ -117,9 +119,11 @@ def model_config_from_dict(values):
     # Before explicit mean pooling, pooled roles used sum(alpha * value).
     values.setdefault("attention_pool_reduction", "sum")
     values.setdefault("attention_score", "dot_product")
-    values.setdefault("joint_local_mixer", "conv")
+    values.setdefault("attention_history_scope", "joint")
+    values.setdefault("joint_ssm_fusion", "off")
+
     values.setdefault("joint_gate_normalization", "sigmoid")
-    values.setdefault("joint_local_kernel", "on")
+    values.setdefault("joint_local_kernel", "off")
     if (values.get("graph_update_mode", "baseline") == "attention_joint"
             and values.get("attention_layout") != "pooled_roles_v1"):
         raise ValueError("This is an older attention_joint checkpoint with two sequential stages. "
@@ -132,9 +136,6 @@ def model_config_from_dict(values):
     if values["fusion_mode"] == "sum":
         for field in ("fusion_aux_weight", "fusion_alpha_init", "fusion_beta_init"):
             values.pop(field, None)
-    # Historical baseline checkpoints carried this unused option.
-    if values.get("graph_update_mode", "baseline") == "baseline" and not values.get("context_first_dropout", 0):
-        values.pop("context_first_dropout", None)
     return ModelConfig(**values)
 
 

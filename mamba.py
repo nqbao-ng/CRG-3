@@ -17,41 +17,28 @@ class RMSNorm(nn.Module):
         return (xf * self.weight.float()).to(x.dtype)
 
 
-class MambaMixer(nn.Module):
-    """in_proj -> causal depthwise conv -> SiLU -> selective SSM, gated by SiLU(z) -> out_proj.
-    """
+class SelectiveStateSpace(nn.Module):
+    """Input-dependent SSM at the feature width; no u/z branches or expansion."""
 
-    def __init__(self, d_model, d_state=16, d_conv=4,
+    def __init__(self, d_model, d_state=16,
                  dt_min=1e-3, dt_max=1e-1, dt_init_floor=1e-4):
         super().__init__()
-        d_inner = d_model  # width-preserving: no expansion hyperparameter
-        self.d_inner, self.d_state = d_inner, d_state
+        self.d_inner, self.d_state = d_model, d_state
         self.dt_rank = math.ceil(d_model / 16)
-        self.in_proj = nn.Linear(d_model, 2 * d_inner, bias=False)
-        self.out_proj = nn.Linear(d_inner, d_model, bias=False)
-        self.conv1d = nn.Conv1d(d_inner, d_inner, d_conv, groups=d_inner, padding=d_conv - 1)
-        self.x_proj = nn.Linear(d_inner, self.dt_rank + 2 * d_state, bias=False)
-        self.dt_proj = nn.Linear(self.dt_rank, d_inner, bias=True)
+        self._init_state_parameters(dt_min, dt_max, dt_init_floor)
 
-        # Mamba initialisation of dt and A
+    def _init_state_parameters(self, dt_min=1e-3, dt_max=1e-1, dt_init_floor=1e-4):
+        d_state = self.d_state
+        self.x_proj = nn.Linear(self.d_inner, self.dt_rank + 2 * d_state, bias=False)
+        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
         nn.init.uniform_(self.dt_proj.weight, -self.dt_rank ** -0.5, self.dt_rank ** -0.5)
-        dt = torch.exp(torch.rand(d_inner) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min))
+        dt = torch.exp(torch.rand(self.d_inner) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min))
         dt = dt.clamp(min=dt_init_floor)
         with torch.no_grad():
             self.dt_proj.bias.copy_(dt + torch.log(-torch.expm1(-dt)))
-        A = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(d_inner, 1)
+        A = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)
         self.A_log = nn.Parameter(torch.log(A))
-        self.D = nn.Parameter(torch.ones(d_inner))
-
-    def forward(self, x):
-        # x: [batch, L, d_model]; causal along L
-        L = x.shape[1]
-        u, z = self.in_proj(x).chunk(2, dim=-1)
-        u = self.conv1d(u.transpose(1, 2))[..., :L].transpose(1, 2)
-        u = F.silu(u)
-        y = self.selective_scan(u)
-        y = y * F.silu(z)
-        return self.out_proj(y)
+        self.D = nn.Parameter(torch.ones(self.d_inner))
 
     def selective_scan(self, u):
         dtype = u.dtype
@@ -70,43 +57,5 @@ class MambaMixer(nn.Module):
             y = torch.stack(ys, dim=1) + u * self.D
         return y.to(dtype)
 
-
-class SelectiveStateSpace(nn.Module):
-    """Selective SSM for transformed inputs, with no local convolution.
-
-    Reuses the same PyTorch recurrence as MambaMixer. Input projection,
-    local interaction, output gating and projection are owned by the caller.
-    """
-
-    def __init__(self, d_model, d_state=16,
-                 dt_min=1e-3, dt_max=1e-1, dt_init_floor=1e-4):
-        super().__init__()
-        self.d_inner, self.d_state = d_model, d_state
-        self.dt_rank = math.ceil(d_model / 16)
-        self.x_proj = nn.Linear(self.d_inner, self.dt_rank + 2 * d_state, bias=False)
-        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
-        nn.init.uniform_(self.dt_proj.weight, -self.dt_rank ** -0.5, self.dt_rank ** -0.5)
-        dt = torch.exp(torch.rand(self.d_inner) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min))
-        dt = dt.clamp(min=dt_init_floor)
-        with torch.no_grad():
-            self.dt_proj.bias.copy_(dt + torch.log(-torch.expm1(-dt)))
-        A = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)
-        self.A_log = nn.Parameter(torch.log(A))
-        self.D = nn.Parameter(torch.ones(self.d_inner))
-
     def forward(self, v):
-        return MambaMixer.selective_scan(self, v)
-
-
-class MambaBlock(nn.Module):
-    """Residual Mamba block with optional pre-Mixer RMSNorm."""
-
-    def __init__(self, d_model, d_state=16, d_conv=4, use_rmsnorm=True):
-        super().__init__()
-        self.norm = RMSNorm(d_model) if use_rmsnorm else nn.Identity()
-        self.mixer = MambaMixer(d_model, d_state, d_conv)
-
-    def forward(self, x):
-        return x + self.mixer(self.norm(x))
-
-
+        return self.selective_scan(v)

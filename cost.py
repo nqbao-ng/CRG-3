@@ -1,4 +1,4 @@
-"""Shape-based forward arithmetic accounting, including opaque CUDA selective scan.
+"""Shape-based forward arithmetic accounting, including the selective SSM recurrence.
 
 Convention: one multiply-accumulate = two FLOPs. Count Linear/Conv1d (including
 bias), dense adjacency aggregation, attention arithmetic, and the sequential-equivalent
@@ -11,8 +11,8 @@ from collections import Counter
 import torch.nn as nn
 
 from . import attention_graph
-from .mamba import MambaMixer, SelectiveStateSpace
-from .gated_local import GatedLocalConv
+from .mamba import SelectiveStateSpace
+from .gated_local import GatedLocalMixer
 
 
 class ForwardCost:
@@ -53,7 +53,7 @@ class ForwardCost:
         # sigmoid/softmax/tanh/SiLU and masks stay excluded by this convention.
         slots = rows * length * width * channels
         # Removing k_l also removes one candidate multiplication per slot.
-        self.counts['gated_local_flops'] += (6 if module.kernel is None else 7) * slots
+        self.counts['gated_local_flops'] += 6 * slots
         self.counts['gated_local_calls'] += 1
 
     def additive_score(self, module, inputs, output):
@@ -65,18 +65,26 @@ class ForwardCost:
             + 2 * rows * width * modalities)
         self.counts['gat_score_calls'] += 1
 
+    def shared_fusion(self, module, inputs, output):
+        # Three gate multiplications + residual additions; projections and SSM
+        # are already counted by their own hooks. Sigmoid remains excluded.
+        self.counts['shared_fusion_flops'] += 2 * sum(value.numel() for value in output.values())
+        self.counts['shared_fusion_calls'] += 1
+
     def __enter__(self):
         for module in self.model.modules():
             if isinstance(module, nn.Linear):
                 self.handles.append(module.register_forward_hook(self.linear))
             elif isinstance(module, nn.Conv1d):
                 self.handles.append(module.register_forward_hook(self.conv))
-            elif isinstance(module, (MambaMixer, SelectiveStateSpace)):
+            elif isinstance(module, SelectiveStateSpace):
                 self.handles.append(module.register_forward_hook(self.scan))
-            elif isinstance(module, GatedLocalConv):
+            elif isinstance(module, GatedLocalMixer):
                 self.handles.append(module.register_forward_hook(self.gated_local))
             elif isinstance(module, attention_graph.AdditiveRelationScorer):
                 self.handles.append(module.register_forward_hook(self.additive_score))
+            elif isinstance(module, attention_graph.GatedSharedRoleSSM):
+                self.handles.append(module.register_forward_hook(self.shared_fusion))
         self.original_attention = attention_graph.attention_messages
 
         def counted_attention(query, keys, values, mask, normalization='joint', *, scores=None):
@@ -95,8 +103,8 @@ class ForwardCost:
             # attention_messages counts modality reduction; pooling also reduces time.
             rows, width, _, hidden = keys.shape
             self.counts['attention_flops'] += rows * hidden * max(0, width - 1)
-            if reduction == 'mean':
-                self.counts['attention_flops'] += rows * hidden  # divide pooled vector by valid count
+            if reduction in ('mean', 'modality_mean'):
+                self.counts['attention_flops'] += rows * hidden  # source-count or modality-count division
             self.counts['attention_pool_calls'] += 1
             return self.original_pool(query, keys, values, mask, reduction, scores=scores)
 
@@ -122,6 +130,6 @@ class ForwardCost:
         result = dict(self.counts)
         result['total_major_arithmetic_flops'] = sum(self.counts[k] for k in (
             'linear_flops', 'conv1d_flops', 'attention_flops', 'scan_arithmetic_flops',
-            'gated_local_flops', 'adjacency_flops'))
+            'gated_local_flops', 'adjacency_flops', 'shared_fusion_flops'))
         result['gflops'] = result['total_major_arithmetic_flops'] / 1e9
         return result

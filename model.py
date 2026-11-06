@@ -3,15 +3,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .graph import GraphEncoder
 from .attention_graph import AttentionGraphEncoder
 from .config import LLMConfig
 from .llm import MultimodalLLMDecoder
 
 
 class CRG3(nn.Module):
-    graph_encoder_class = GraphEncoder
-
     def __init__(self, cfg, feature_dims, num_classes, *, llm_config=None,
                  label_names=None, language_model=None, tokenizer=None):
         super().__init__()
@@ -23,8 +20,7 @@ class CRG3(nn.Module):
             "a": nn.Sequential(nn.Linear(feature_dims["audio"], d), nn.LayerNorm(d), nn.Dropout(cfg.dropout)),
             "v": nn.Sequential(nn.Linear(feature_dims["visual"], d), nn.LayerNorm(d), nn.Dropout(cfg.dropout)),
         })
-        encoder = self.graph_encoder_class if cfg.graph_update_mode == "baseline" else AttentionGraphEncoder
-        self.graph = encoder(cfg)
+        self.graph = AttentionGraphEncoder(cfg)
         if self.decoder_mode == "classifier":
             self.classifier = nn.Sequential(nn.Dropout(cfg.dropout), nn.Linear(d, num_classes))
             if cfg.fusion_mode == "concat":
@@ -63,12 +59,9 @@ class CRG3(nn.Module):
         h = {"t": self.input_proj["t"](batch["text"]) * mask,
              "a": self.input_proj["a"](batch["audio"]) * mask,
              "v": self.input_proj["v"](batch["visual"]) * mask}
-        if self.cfg.graph_update_mode == "attention_joint":
-            q, diagnostics = self.graph(h, batch.get("diff"), batch.get("same"), valid,
-                                        speakers=batch.get("speaker"),
-                                        adjacency=batch.get("adjacency"))
-        else:
-            q, diagnostics = self.graph(h, batch["diff"], batch["same"], valid)
+        q, diagnostics = self.graph(h, batch.get("diff"), batch.get("same"), valid,
+                                    speakers=batch.get("speaker"),
+                                    adjacency=batch.get("adjacency"))
         return q, diagnostics
 
     def fused_features(self, batch):
@@ -119,5 +112,5 @@ class CRG3(nn.Module):
 
 
 def build_model(cfg, feature_dims, num_classes, **kwargs):
-    """Single model factory; variants are selected by graph_update_mode."""
+    """Build the CRG encoder with sum/concat readout or the optional LLM decoder."""
     return CRG3(cfg, feature_dims, num_classes, **kwargs)
