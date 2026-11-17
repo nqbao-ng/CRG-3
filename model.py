@@ -4,101 +4,96 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .attention_graph import AttentionGraphEncoder
-from .config import LLMConfig
-from .llm import MultimodalLLMDecoder
+from .affect_fusion import PairwiseGMUFusion, TextAnchoredGMUFusion
+from .config import TEXT_ANCHORED_GMU_MODES
+from .graph import MODALITY_FEATURES
 
 
 class CRG3(nn.Module):
-    def __init__(self, cfg, feature_dims, num_classes, *, llm_config=None,
-                 label_names=None, language_model=None, tokenizer=None):
+    def __init__(self, cfg, feature_dims, num_classes):
         super().__init__()
         self.cfg = cfg
-        self.decoder_mode = cfg.decoder_mode
+        self.modalities = tuple(cfg.modalities)
         d = cfg.hidden
         self.input_proj = nn.ModuleDict({
-            "t": nn.Sequential(nn.Linear(feature_dims["text"], d), nn.LayerNorm(d), nn.Dropout(cfg.dropout)),
-            "a": nn.Sequential(nn.Linear(feature_dims["audio"], d), nn.LayerNorm(d), nn.Dropout(cfg.dropout)),
-            "v": nn.Sequential(nn.Linear(feature_dims["visual"], d), nn.LayerNorm(d), nn.Dropout(cfg.dropout)),
+            m: nn.Sequential(nn.Linear(feature_dims[MODALITY_FEATURES[m]], d),
+                             nn.LayerNorm(d), nn.Dropout(cfg.dropout))
+            for m in self.modalities
         })
         self.graph = AttentionGraphEncoder(cfg)
-        if self.decoder_mode == "classifier":
-            self.classifier = nn.Sequential(nn.Dropout(cfg.dropout), nn.Linear(d, num_classes))
-            if cfg.fusion_mode == "concat":
-                # Match the original sum model's encoder initialization and
-                # post-construction RNG, keeping only a new standard 3d head.
-                with torch.random.fork_rng(devices=[]):
-                    self.classifier[1] = nn.Linear(3 * d, num_classes)
-        else:
-            if label_names is None or len(label_names) != num_classes:
-                raise ValueError("LLM mode requires label_names in dataset class-ID order")
-            self.classifier = None
-            self.llm_config = llm_config or LLMConfig()
-            self.llm_decoder = MultimodalLLMDecoder(
-                d, label_names, self.llm_config, language_model=language_model, tokenizer=tokenizer)
-            if self.llm_config.freeze_graph:
-                self.input_proj.requires_grad_(False)
-                self.graph.requires_grad_(False)
-                self.input_proj.eval()
-                self.graph.eval()
-
-    def train(self, mode=True):
-        super().train(mode)
-        if self.decoder_mode == "llm" and self.llm_config.freeze_graph:
-            self.input_proj.eval()
-            self.graph.eval()
-        return self
+        self.classifier = nn.Sequential(nn.Dropout(cfg.dropout), nn.Linear(d, num_classes))
+        # Keep common encoder weights and the RNG state matched across fusion modes.
+        with torch.random.fork_rng(devices=[]):
+            if cfg.fusion_mode != "sum":
+                self.classifier[1] = nn.Linear(len(self.modalities) * d, num_classes)
+                if cfg.fusion_mode == "gmu_pairwise_concat":
+                    self.pairwise_gmu = PairwiseGMUFusion(d, use_product=cfg.gmu_pairwise_product == "on")
+                elif cfg.fusion_mode in TEXT_ANCHORED_GMU_MODES:
+                    self.text_anchored_gmu = TextAnchoredGMUFusion(
+                        d, pair_interaction=cfg.fusion_mode == "gmu_text_anchor_interaction_concat")
+        self.modality_heads = None
+        if cfg.modality_loss_weight:
+            with torch.random.fork_rng(devices=[]):
+                self.modality_heads = nn.ModuleList(nn.Linear(d, num_classes) for _ in self.modalities)
 
     def modality_features(self, batch):
-        """Return the three contextual CRG outputs, each [B,N,H]."""
-        if "graph_features" in batch:
-            if self.decoder_mode != "llm" or not self.llm_config.freeze_graph:
-                raise ValueError("Cached graph features require frozen-graph LLM mode")
-            return batch["graph_features"], {}
+        """Return one contextual CRG output per active modality, each [B,N,H]."""
         valid = batch["mask"]
         mask = valid.unsqueeze(-1)
-        h = {"t": self.input_proj["t"](batch["text"]) * mask,
-             "a": self.input_proj["a"](batch["audio"]) * mask,
-             "v": self.input_proj["v"](batch["visual"]) * mask}
+        h = {m: self.input_proj[m](batch[MODALITY_FEATURES[m]]) * mask for m in self.modalities}
         q, diagnostics = self.graph(h, batch.get("diff"), batch.get("same"), valid,
                                     speakers=batch.get("speaker"),
                                     adjacency=batch.get("adjacency"))
         return q, diagnostics
 
-    def fused_features(self, batch):
-        q, diagnostics = self.modality_features(batch)
-        if self.cfg.fusion_mode == "concat":
-            return torch.cat([q["t"], q["a"], q["v"]], dim=-1), diagnostics
-        return q["t"] + q["a"] + q["v"], diagnostics
+    def _fuse(self, features, valid):
+        if self.cfg.fusion_mode == "gmu_pairwise_concat":
+            return self.pairwise_gmu(features).masked_fill(~valid.unsqueeze(-1), 0)
+        if self.cfg.fusion_mode in TEXT_ANCHORED_GMU_MODES:
+            return self.text_anchored_gmu(features).masked_fill(~valid.unsqueeze(-1), 0)
+        # Plain readouts support saved baseline checkpoints.
+        private = tuple(features[m] for m in self.modalities)
+        if self.cfg.fusion_mode == "sum":
+            return sum(private[1:], private[0])
+        return torch.cat(private, dim=-1)
 
-    def forward(self, batch, target_indices=None, return_aux=False):
-        if self.decoder_mode == "llm":
-            q, _ = self.modality_features(batch)
-            return self.llm_decoder(q, batch, target_indices=target_indices)
-        fused, _ = self.fused_features(batch)
-        logits = self.classifier(fused)
+    def fused_features(self, batch):
+        features, diagnostics = self.modality_features(batch)
+        return self._fuse(features, batch["mask"]), diagnostics
+
+    def forward(self, batch, return_aux=False):
+        q, _ = self.modality_features(batch)
+        logits = self.classifier(self._fuse(q, batch["mask"]))
         if return_aux:
             # Tensor-only dictionary is compatible with DataParallel gather.
-            return {"logits": logits}
+            output = {"logits": logits}
+            if self.modality_heads is not None:
+                output["modality_logits"] = torch.stack([
+                    head(q[m]) for m, head in zip(self.modalities, self.modality_heads)
+                ], dim=-2)
+            return output
         return logits
 
-    def loss(self, batch, target_indices=None):
-        if self.decoder_mode == "llm":
-            return self(batch, target_indices=target_indices).loss
+    def loss(self, batch):
         output = self(batch, return_aux=True)
         return self.classification_losses(output, batch["label"], batch["mask"])["loss"]
 
     def classification_losses(self, output, labels, valid, loss_function=F.cross_entropy):
-        """Masked CE shared by model.loss, CLI/notebooks and DataParallel."""
-        main = loss_function(output["logits"][valid].float(), labels[valid])
-        return {"loss": main, "classification_loss": main}
+        """Masked classification loss and optional auxiliary supervision."""
+        class_ids = labels[valid]
+        main = loss_function(output["logits"][valid].float(), class_ids)
+        losses = {"loss": main, "classification_loss": main}
+        if "modality_logits" in output:
+            logits = output["modality_logits"][valid].float()
+            targets = class_ids[:, None].expand(-1, logits.shape[1])
+            modality_ce = loss_function(logits.flatten(0, 1), targets.reshape(-1))
+            losses.update(loss=main + self.cfg.modality_loss_weight * modality_ce, modality_loss=modality_ce)
+        return losses
 
     @torch.no_grad()
-    def predict(self, batch, target_indices=None):
-        if self.decoder_mode == "classifier":
-            result = self(batch).argmax(-1)
-            return result.masked_fill(~batch["mask"], -100)
-        q, _ = self.modality_features(batch)
-        return self.llm_decoder.generate_labels(q, batch, target_indices=target_indices)
+    def predict(self, batch):
+        result = self(batch).argmax(-1)
+        return result.masked_fill(~batch["mask"], -100)
 
     def encoder_state_dict(self):
         return {name: value for name, value in self.state_dict().items()
@@ -111,6 +106,6 @@ class CRG3(nn.Module):
                                     if k.startswith(prefix)}, strict=True)
 
 
-def build_model(cfg, feature_dims, num_classes, **kwargs):
-    """Build the CRG encoder with sum/concat readout or the optional LLM decoder."""
-    return CRG3(cfg, feature_dims, num_classes, **kwargs)
+def build_model(cfg, feature_dims, num_classes):
+    """Build the CRG encoder and classifier."""
+    return CRG3(cfg, feature_dims, num_classes)

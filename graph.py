@@ -2,7 +2,8 @@
 import torch
 import torch.nn as nn
 
-MODALITIES = ("t", "a", "v")
+MODALITY_FEATURES = {"t": "text", "a": "audio", "v": "visual"}
+MODALITIES = tuple(MODALITY_FEATURES)
 
 
 class GateUpdate(nn.Module):

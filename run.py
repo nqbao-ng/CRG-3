@@ -4,7 +4,7 @@ import hashlib
 import json
 import random
 import time
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from pathlib import Path
 
 import numpy as np
@@ -52,12 +52,20 @@ def parse_args(argv=None):
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--amp", action="store_true", help="Use bfloat16 autocast on supported CUDA GPUs")
     parser.add_argument("--multi_gpu", action="store_true", help="Use all visible CUDA GPUs with DataParallel")
-    for name, field in ModelConfig.__dataclass_fields__.items():
+    for field in fields(ModelConfig):
+        name = field.name
+        if name == "modality_loss_weight":
+            continue  # Legacy concat checkpoint metadata.
         options = {}
         if name == "graph_update_mode":
             options["choices"] = GRAPH_UPDATE_MODES
         if name == "fusion_mode":
             options["choices"] = FUSION_MODES
+        if name == "gmu_pairwise_product":
+            options.update(choices=("on", "off"),
+                           help="Include the projected elementwise product in each GMU candidate")
+        if name == "modalities":
+            options.update(choices=("tav",), help="Use Text, Audio and Visual for fusion")
         if name == "attention_adjacent_source":
             options["choices"] = ("input", "updated")
         if name == "attention_pool_reduction":
@@ -97,8 +105,6 @@ def parse_args(argv=None):
         config_from_args(args)
     except ValueError as error:
         parser.error(str(error))
-    if args.decoder_mode != "classifier":
-        parser.error("Use python -m CRG3.run_llm for the generative LLM decoder")
     if not 0 <= args.valid_ratio < 1:
         parser.error("valid_ratio must be in [0, 1)")
     if args.validation_split == "session" and args.dataset not in ("IEMOCAP", "IEMOCAP4"):
@@ -113,7 +119,9 @@ def parse_args(argv=None):
 
 
 def config_from_args(args):
-    return ModelConfig(**{name: getattr(args, name) for name in ModelConfig.__dataclass_fields__})
+    config = {field.name: getattr(args, field.name) for field in fields(ModelConfig)
+              if field.name != "modality_loss_weight"}
+    return ModelConfig(**config)
 
 
 def seed_everything(seed):
@@ -133,7 +141,8 @@ def get_train_valid_sampler(trainset, valid=0.1, dataset="IEMOCAP", limit_dialog
 
 def get_IEMOCAP_loaders(batch_size=32, valid=0.1, num_workers=0, pin_memory=False,
                         data_path=None, local_window=20, limit_dialogs=0,
-                        dataset="IEMOCAP", validation_session=1, validation_split="ratio"):
+                        dataset="IEMOCAP", validation_session=1, validation_split="ratio",
+                        *, modalities="tav"):
     trainset = GraphSmileDataset(data_path, dataset, "train")
     testset = GraphSmileDataset(data_path, dataset, "test")
     if trainset.feature_dims != testset.feature_dims:
@@ -144,7 +153,7 @@ def get_IEMOCAP_loaders(batch_size=32, valid=0.1, num_workers=0, pin_memory=Fals
         raise ValueError("IEMOCAP test must contain only session 5")
     train_indices, val_indices = split_train_validation(
         trainset, dataset, valid, validation_session, limit_dialogs, validation_split)
-    kwargs = dict(batch_size=batch_size, collate_fn=Collator(local_window),
+    kwargs = dict(batch_size=batch_size, collate_fn=Collator(local_window, modalities=modalities),
                   num_workers=num_workers, pin_memory=pin_memory)
     train_loader = DataLoader(trainset, sampler=SubsetRandomSampler(train_indices), **kwargs)
     # Sequential validation batches make checkpoint verification deterministic.
@@ -156,24 +165,26 @@ def get_IEMOCAP_loaders(batch_size=32, valid=0.1, num_workers=0, pin_memory=Fals
 
 def get_MELD_loaders(batch_size=32, valid=0.1, num_workers=0, pin_memory=False,
                      data_path=None, local_window=20, limit_dialogs=0, validation_session=1,
-                     validation_split="ratio"):
+                     validation_split="ratio", *, modalities="tav"):
     if validation_split == "native":
         return get_MELD_native_loaders(batch_size, valid, num_workers, pin_memory,
-                                      data_path, local_window, limit_dialogs)
+                                      data_path, local_window, limit_dialogs, modalities=modalities)
     return get_IEMOCAP_loaders(batch_size, valid, num_workers, pin_memory,
                               data_path, local_window, limit_dialogs, "MELD", validation_session,
-                              validation_split)
+                              validation_split, modalities=modalities)
 
 
 def get_MELD_native_loaders(batch_size=16, valid=0.1, num_workers=0, pin_memory=False,
-                            data_path=None, local_window=10, limit_dialogs=0):
+                            data_path=None, local_window=10, limit_dialogs=0, *, modalities="tav"):
     """Official MELD train/dev/test. valid=0 merges train+dev and disables dev."""
     if not 0 <= valid < 1:
         raise ValueError("valid must be in [0,1)")
     native = json.loads((Path(__file__).parent / 'meld_native_split.json').read_text())
+    digest = hashlib.sha256()
     with Path(data_path).open('rb') as handle:
-        digest = hashlib.file_digest(handle, 'sha256').hexdigest()
-    if digest != native['dataset_sha256']:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(chunk)
+    if digest.hexdigest() != native['dataset_sha256']:
         raise ValueError("Native MELD manifest does not match this feature pickle")
     trainset = GraphSmileDataset(data_path, 'MELD', 'train')
     testset = GraphSmileDataset(data_path, 'MELD', 'test')
@@ -195,7 +206,7 @@ def get_MELD_native_loaders(batch_size=16, valid=0.1, num_workers=0, pin_memory=
     test_ids = [test_lookup[k] for k in groups['test']]
     if limit_dialogs:
         train_ids, val_ids, test_ids = (ids[:limit_dialogs] for ids in (train_ids, val_ids, test_ids))
-    options = dict(batch_size=batch_size, collate_fn=Collator(local_window),
+    options = dict(batch_size=batch_size, collate_fn=Collator(local_window, modalities=modalities),
                    num_workers=num_workers, pin_memory=pin_memory)
     return (DataLoader(trainset, sampler=SubsetRandomSampler(train_ids), **options),
             DataLoader(Subset(trainset, val_ids), **options) if val_ids else None,
@@ -227,8 +238,9 @@ def train_or_eval_graph_model(model, loss_function, dataloader, epoch, device,
         model.train()
     else:
         model.eval()
-    loss_sum, loss_denominator, n_utterances = 0.0, 0.0, 0
+    ce_sum, ce_denominator, modality_sum, n_utterances = 0.0, 0.0, 0.0, 0
     core = model.module if isinstance(model, torch.nn.DataParallel) else model
+    use_aux = train and core.modality_heads is not None
     labels, preds = [], []
 
     with torch.set_grad_enabled(train):
@@ -238,7 +250,7 @@ def train_or_eval_graph_model(model, loss_function, dataloader, epoch, device,
                 optimizer.zero_grad(set_to_none=True)
 
             with autocast():
-                output = {"logits": model(batch)}
+                output = model(batch, return_aux=True) if use_aux else {"logits": model(batch)}
                 logits = output["logits"]
                 mask = batch["mask"]
                 losses = core.classification_losses(output, batch["label"], mask, loss_function)
@@ -250,8 +262,10 @@ def train_or_eval_graph_model(model, loss_function, dataloader, epoch, device,
             class_weights = getattr(loss_function, "weight", None)
             batch_denominator = (float(class_weights[batch["label"][mask]].sum().item())
                                  if class_weights is not None else count)
-            loss_sum += float(loss.item()) * batch_denominator
-            loss_denominator += batch_denominator
+            ce_sum += float(losses["classification_loss"].item()) * batch_denominator
+            ce_denominator += batch_denominator
+            if use_aux:
+                modality_sum += float(losses["modality_loss"].item()) * batch_denominator
             n_utterances += count
 
             if train:
@@ -261,11 +275,16 @@ def train_or_eval_graph_model(model, loss_function, dataloader, epoch, device,
 
     if n_utterances == 0:
         raise ValueError("Empty dataloader")
-    metrics = {"loss": loss_sum / loss_denominator,
+    ce_mean = ce_sum / ce_denominator
+    metrics = {"loss": ce_mean,
             "accuracy": 100 * accuracy_score(labels, preds),
             "weighted_f1": 100 * f1_score(labels, preds, average="weighted", zero_division=0),
             "macro_f1": 100 * f1_score(labels, preds, average="macro", zero_division=0),
             "n_utterances": n_utterances}
+    if use_aux:
+        modality_mean = modality_sum / ce_denominator
+        metrics.update(loss=ce_mean + core.cfg.modality_loss_weight * modality_mean,
+                       classification_loss=ce_mean, modality_loss=modality_mean)
     return metrics
 
 
@@ -287,7 +306,7 @@ def main(argv=None):
                          num_workers=args.num_workers, pin_memory=False,
                          data_path=args.data_path, local_window=args.local_window,
                          limit_dialogs=args.limit_dialogs, validation_session=args.validation_session,
-                         validation_split=args.validation_split)
+                         validation_split=args.validation_split, modalities=args.modalities)
     if args.dataset == "IEMOCAP":
         train_loader, valid_loader, test_loader = get_IEMOCAP_loaders(**loader_kwargs)
     elif args.dataset == "MELD":

@@ -4,13 +4,13 @@ Only the precomputed textf0, audio, visual, speakers, emotion labels and
 official train/test dialogue IDs are read. GraphSmile model modules are unused.
 """
 import pickle
-import json
 import re
-from pathlib import Path
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+
+from .graph import MODALITY_FEATURES
 
 
 NUM_CLASSES = {"IEMOCAP": 6, "IEMOCAP4": 4, "MELD": 7, "CMUMOSEI7": 7}
@@ -100,8 +100,7 @@ def _mosei_class(values):
 class GraphSmileDataset(Dataset):
     """Official GraphSmile dialogue split, with textf0 as the only text stream."""
 
-    def __init__(self, path, dataset="IEMOCAP", split="train", *,
-                 include_transcript=False, transcripts_path=None):
+    def __init__(self, path, dataset="IEMOCAP", split="train"):
         if dataset not in NUM_CLASSES:
             raise ValueError(f"Unsupported dataset: {dataset}")
         if split not in ("train", "test"):
@@ -123,14 +122,6 @@ class GraphSmileDataset(Dataset):
                 raise ValueError("Expected GraphSmile single-text pickle layout")
             ids, speakers, labels, text, audio, visual = raw[0], raw[1], raw[2], raw[3], raw[4], raw[5]
             train_ids, test_ids = raw[7], raw[8]
-        transcripts = None
-        if include_transcript:
-            if transcripts_path:
-                transcripts = json.loads(Path(transcripts_path).read_text(encoding="utf-8"))
-            elif dataset in ("IEMOCAP", "MELD"):
-                transcripts = raw[9 if dataset == "IEMOCAP" else 10]
-            if not isinstance(transcripts, dict):
-                raise ValueError("Supply transcript JSON {dialogue_id: [utterance strings]} for this dataset")
         self.keys = list(train_ids if split == "train" else test_ids)
         if not self.keys:
             raise ValueError(f"Empty {split} split")
@@ -150,12 +141,6 @@ class GraphSmileDataset(Dataset):
                 raise ValueError(f"Non-finite feature in dialogue {key}")
             self.records.append({"id": key, "text": t, "audio": a, "visual": v,
                                  "speaker": _speaker_ids(speakers[key]), "label": y})
-            if include_transcript:
-                sentences = transcripts.get(key, transcripts.get(str(key)))
-                if (not isinstance(sentences, (list, tuple)) or len(sentences) != n or
-                        any(not isinstance(x, str) or not x.strip() for x in sentences)):
-                    raise ValueError(f"Missing/invalid transcripts for dialogue {key}")
-                self.records[-1]["transcript"] = list(sentences)
         first = self.records[0]
         self.feature_dims = {m: first[m].shape[1] for m in ("text", "audio", "visual")}
         for record in self.records:
@@ -171,8 +156,9 @@ class GraphSmileDataset(Dataset):
 
 
 class Collator:
-    def __init__(self, local_window=20):
+    def __init__(self, local_window=20, *, modalities="tav"):
         self.local_window = local_window
+        self.feature_names = tuple(MODALITY_FEATURES[m] for m in modalities)
 
     def __call__(self, items):
         batch_size = len(items)
@@ -181,7 +167,7 @@ class Collator:
         labels = torch.full((batch_size, max_length), -100, dtype=torch.long)
         speaker = torch.full((batch_size, max_length), -1, dtype=torch.long)
         features = {m: torch.zeros(batch_size, max_length, items[0][m].shape[1])
-                    for m in ("text", "audio", "visual")}
+                    for m in self.feature_names}
         diff, same = [], []
         for b, item in enumerate(items):
             n = len(item["label"])
@@ -197,10 +183,6 @@ class Collator:
                 "diff": pack_neighbors(diff, max_length),
                 "same": pack_neighbors(same, max_length),
                 "ids": [item["id"] for item in items]}
-        if any("transcript" in item for item in items):
-            if not all("transcript" in item for item in items):
-                raise ValueError("Cannot mix records with and without transcripts")
-            batch["transcript"] = [item["transcript"] for item in items]
         return batch
 
 

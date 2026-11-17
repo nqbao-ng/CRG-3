@@ -1,11 +1,15 @@
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
+from math import isfinite
 
 
 GRAPH_UPDATE_MODES = ("attention_joint",)
-FUSION_MODES = ("sum", "concat")
+TEXT_ANCHORED_GMU_MODES = ("gmu_text_anchor_concat", "gmu_text_anchor_interaction_concat")
+FUSION_MODES = ("gmu_pairwise_concat", *TEXT_ANCHORED_GMU_MODES)
+_BASELINE_READOUTS = ("sum", "concat")  # Saved baseline checkpoints.
 JOINT_SSM_FUSION_MODES = ("off", "gated")
 ATTENTION_HISTORY_SCOPES = ("joint", "intra")
 ROLE_SCAN_MODES = ("forward", "sequential", "cagmamba")
+INPUT_MODALITY_MODES = ("tav", "ta")
 
 
 @dataclass
@@ -26,16 +30,19 @@ class ModelConfig:
     attention_adjacent_source: str = "updated"  # input: A, updated: recurrent B
     attention_pool_reduction: str = "mean"  # legacy mean | joint sum | modality_mean (separate softmax + mean)
     attention_score: str = "dot_product"  # dot_product | gat (additive scorer only)
-    joint_local_mixer: str = "gmu_tanh_no_uz"  # fixed kernel-free tanh SSM, no u/z
+    joint_local_mixer: str = "gmu_tanh_no_uz"
     joint_gate_normalization: str = "sigmoid"  # fixed scalar local gates
     joint_local_kernel: str = "off"  # fixed: no learned lag kernel
     joint_ssm_fusion: str = "off"  # off | gated; gated_concat is retained for checkpoint loading
-    fusion_mode: str = "sum"  # sum: Linear(H,C); concat(T,A,V): Linear(3H,C)
-    decoder_mode: str = "classifier"  # classifier | llm
+    fusion_mode: str = "gmu_pairwise_concat"
+    gmu_pairwise_product: str = "on"
+    decoder_mode: InitVar[str] = "classifier"  # accepted only for legacy classifier metadata
     attention_history_scope: str = "joint"  # joint T/A/V or intra-modality Same/Diff sources
     role_scan_mode: str = "forward"  # forward | sequential | cagmamba
+    modality_loss_weight: float = 0.0  # legacy concat checkpoint with modality heads
+    modalities: str = "tav"  # ta: legacy Text + Audio baselines
 
-    def __post_init__(self):
+    def __post_init__(self, decoder_mode):
         if self.model_type != "crg3":
             raise ValueError("Only model_type='crg3' is supported")
         if self.graph_update_mode not in GRAPH_UPDATE_MODES:
@@ -63,22 +70,37 @@ class ModelConfig:
         if self.role_scan_mode != "forward" and self.joint_ssm_fusion != "off":
             raise ValueError("Bidirectional role scans require joint_ssm_fusion='off'")
         if self.joint_local_mixer != "gmu_tanh_no_uz":
-            raise ValueError("Only gmu_tanh_no_uz is retained; use archived source for u/z models")
+            raise ValueError("Only the gmu_tanh_no_uz mixer is supported")
         if self.joint_local_kernel != "off" or self.joint_gate_normalization != "sigmoid":
             raise ValueError("The retained mixer requires no learned kernel and sigmoid local gates")
         if min(self.hidden, self.graph_layers, self.d_state, self.d_conv) < 1:
             raise ValueError("Model dimensions and graph_layers must be positive")
         if self.local_window < 0 or not 0 <= self.dropout < 1:
             raise ValueError("Invalid window or dropout")
-        if self.decoder_mode not in ("classifier", "llm"):
-            raise ValueError("decoder_mode must be 'classifier' or 'llm'")
-        if self.fusion_mode not in FUSION_MODES:
-            raise ValueError(f"fusion_mode must be one of {FUSION_MODES}")
+        if decoder_mode != "classifier":
+            raise ValueError("Only classifier checkpoints are supported")
+        if self.fusion_mode not in (*FUSION_MODES, *_BASELINE_READOUTS):
+            raise ValueError(f"Unsupported readout: {self.fusion_mode}")
+        if self.gmu_pairwise_product not in ("on", "off"):
+            raise ValueError("gmu_pairwise_product must be on or off")
+        if self.modalities not in INPUT_MODALITY_MODES:
+            raise ValueError(f"modalities must be one of {INPUT_MODALITY_MODES}")
+        if self.modalities == "ta" and (self.attention_history_scope != "intra"
+                or self.joint_ssm_fusion != "off"
+                or self.fusion_mode not in ("sum", "concat")):
+            raise ValueError("modalities='ta' requires intra history, shared SSM off, "
+                             "and a sum or concat classifier")
+        if not isfinite(self.modality_loss_weight) or self.modality_loss_weight < 0:
+            raise ValueError("modality_loss_weight must be finite and nonnegative")
+        if self.modality_loss_weight and self.fusion_mode != "concat":
+            raise ValueError("Joint modality heads require the concat classifier")
 
 
 def model_config_from_dict(values):
     """Load retained no-u/z checkpoints without reinterpreting retired architectures."""
     values = dict(values)
+    if values.pop("role_order", "diff_same_adjacent_target") != "diff_same_adjacent_target":
+        raise ValueError("This checkpoint uses a retired role order. Load it with its original experiment source.")
     # Retired runtime fields do not affect weights or recurrence. All restored
     # models now use PyTorch without CRG checkpointing. Use archived source to
     # reproduce historical fused-kernel execution exactly.
@@ -107,7 +129,7 @@ def model_config_from_dict(values):
                          "to load its checkpoint; current CRG adds relation embeddings after pooling.")
     if (values.get('graph_update_mode', 'baseline') != 'attention_joint'
             or values.get('joint_local_mixer', 'conv') != 'gmu_tanh_no_uz'):
-        raise ValueError('This checkpoint uses a retired u/z architecture; load its archived source.')
+        raise ValueError('This checkpoint uses a retired u/z architecture or mixer; load its original source.')
     # New models always use d_inner=hidden. Accept old width-preserving configs,
     # but never silently load an expanded checkpoint as a different architecture.
     legacy_expand = values.pop("expand", 1)
@@ -130,32 +152,14 @@ def model_config_from_dict(values):
                          "Use its archived source; pooled_roles_v1 requires a new trained checkpoint.")
     # A checkpoint written before fusion has no fusion weights and used plain sum.
     values.setdefault("fusion_mode", "sum")
-    if values['fusion_mode'] not in FUSION_MODES:
+    if values["fusion_mode"] not in (*FUSION_MODES, *_BASELINE_READOUTS):
         raise ValueError('This checkpoint uses a removed readout; load its archived source.')
+    # These settings were serialized even on checkpoints whose readout never used them.
+    for field in ("cross_modal_reduction", "va_loss_weight", "va_targets", "raven_beta",
+                  "symmetric_shift_tau", "digemo_hard_weight", "digemo_distill_weight", "digemo_temperature"):
+        values.pop(field, None)
     # Sum checkpoints may carry the former, unused confidence-fusion defaults.
     if values["fusion_mode"] == "sum":
         for field in ("fusion_aux_weight", "fusion_alpha_init", "fusion_beta_init"):
             values.pop(field, None)
     return ModelConfig(**values)
-
-
-@dataclass
-class LLMConfig:
-    model_name: str = "Qwen/Qwen2.5-3B-Instruct"
-    load_in_4bit: bool = True
-    device: str = "cuda:0"
-    compute_dtype: str = "float16"
-    lora_rank: int = 8  # zero: train projectors only
-    lora_alpha: int = 16
-    lora_dropout: float = 0.05
-    gradient_checkpointing: bool = True
-    max_prompt_tokens: int = 512  # includes the three feature tokens
-    freeze_graph: bool = True
-
-    def __post_init__(self):
-        if self.compute_dtype not in ("float16", "bfloat16", "float32"):
-            raise ValueError("Unsupported LLM compute_dtype")
-        if self.lora_rank < 0 or self.lora_alpha < 1 or not 0 <= self.lora_dropout < 1:
-            raise ValueError("Invalid LoRA settings")
-        if self.max_prompt_tokens < 32:
-            raise ValueError("max_prompt_tokens must be at least 32")

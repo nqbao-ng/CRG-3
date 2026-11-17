@@ -168,23 +168,24 @@ class AttentionGraphLayer(nn.Module):
         self.pool_reduction = cfg.attention_pool_reduction
         self.attention_score = cfg.attention_score
         self.history_scope = cfg.attention_history_scope
+        self.modalities = tuple(cfg.modalities)
         self.role_scan_mode = cfg.role_scan_mode
         self.joint_ssm_fusion = cfg.joint_ssm_fusion
         # Q/K/V projections are shared BETWEEN groups within this layer, while
         # each group has its own softmax denominator and role embedding.
-        self.pre_norm = nn.ModuleDict({m: nn.LayerNorm(d) for m in MODALITIES})
-        self.query = nn.ModuleDict({m: nn.Linear(d, d, bias=False) for m in MODALITIES})
-        self.key = nn.ModuleDict({m: nn.Linear(d, d, bias=False) for m in MODALITIES})
-        self.value = nn.ModuleDict({m: nn.Linear(d, d, bias=False) for m in MODALITIES})
+        self.pre_norm = nn.ModuleDict({m: nn.LayerNorm(d) for m in self.modalities})
+        self.query = nn.ModuleDict({m: nn.Linear(d, d, bias=False) for m in self.modalities})
+        self.key = nn.ModuleDict({m: nn.Linear(d, d, bias=False) for m in self.modalities})
+        self.value = nn.ModuleDict({m: nn.Linear(d, d, bias=False) for m in self.modalities})
         self.relation_embedding = nn.ParameterDict({
             r: nn.Parameter(torch.zeros(d)) for r in ("diff", "same")})
-        self.adjacent_proj = nn.ModuleDict({m: nn.Linear(d, d) for m in MODALITIES})
+        self.adjacent_proj = nn.ModuleDict({m: nn.Linear(d, d) for m in self.modalities})
         self.adjacent_embedding = nn.Parameter(torch.zeros(d))
-        self.read_proj = nn.ModuleDict({m: nn.Linear(d, d) for m in MODALITIES})
-        self.read_embedding = nn.ParameterDict({m: nn.Parameter(torch.zeros(d)) for m in MODALITIES})
+        self.read_proj = nn.ModuleDict({m: nn.Linear(d, d) for m in self.modalities})
+        self.read_embedding = nn.ParameterDict({m: nn.Parameter(torch.zeros(d)) for m in self.modalities})
         self.scan = nn.ModuleDict({m: DirectGatedRoleSSMBlock(
-            d, cfg.d_state, cfg.d_conv) for m in MODALITIES})
-        self.update = nn.ModuleDict({m: GateUpdate(d, cfg.dropout) for m in MODALITIES})
+            d, cfg.d_state, cfg.d_conv) for m in self.modalities})
+        self.update = nn.ModuleDict({m: GateUpdate(d, cfg.dropout) for m in self.modalities})
         if cfg.graph_gate == "off":
             # Construct identically first so removing gates does not shift the
             # random initialization of context projections or subsequent layers.
@@ -195,7 +196,7 @@ class AttentionGraphLayer(nn.Module):
             # Isolate new initialization so subsequent layers/classifier and
             # common weights match a same-seed dot-product control.
             with torch.random.fork_rng(devices=[]):
-                self.gat_scorer = nn.ModuleDict({m: AdditiveRelationScorer(d) for m in MODALITIES})
+                self.gat_scorer = nn.ModuleDict({m: AdditiveRelationScorer(d) for m in self.modalities})
             # Separate from the retained post-pooling relation embeddings.
             self.score_relation_embedding = nn.ParameterDict({
                 r: nn.Parameter(torch.zeros(d)) for r in ('diff', 'same')})
@@ -211,20 +212,20 @@ class AttentionGraphLayer(nn.Module):
             with torch.random.fork_rng(devices=[]):
                 if self.role_scan_mode == 'sequential':
                     self.reverse_scan = nn.ModuleDict({m: DirectGatedRoleSSMBlock(
-                        d, cfg.d_state, cfg.d_conv) for m in MODALITIES})
+                        d, cfg.d_state, cfg.d_conv) for m in self.modalities})
                     self.reverse_update = nn.ModuleDict({m: GateUpdate(
-                        d, cfg.dropout, use_gate=cfg.graph_gate == 'on') for m in MODALITIES})
+                        d, cfg.dropout, use_gate=cfg.graph_gate == 'on') for m in self.modalities})
                 else:
                     self.reverse_scan = nn.ModuleDict({m: DirectGatedRoleSSMMixer(
-                        d, cfg.d_state, cfg.d_conv, output_projection=False) for m in MODALITIES})
-                    self.bssm_gate = nn.ModuleDict({m: nn.Linear(d, d) for m in MODALITIES})
+                        d, cfg.d_state, cfg.d_conv, output_projection=False) for m in self.modalities})
+                    self.bssm_gate = nn.ModuleDict({m: nn.Linear(d, d) for m in self.modalities})
 
     def _role_rows(self, query, keys, values, target_rows, diff_mask, same_mask,
                    adjacent, adjacent_mask, read, modality):
         # target_rows are flattened B*N indices. Gather only the chronological
         # interval [i-W, i). Restrict modalities before gathering the window.
         if self.history_scope == 'intra':
-            source_modality = MODALITIES.index(modality)
+            source_modality = self.modalities.index(modality)
             keys = keys[:, :, source_modality:source_modality + 1]
             values = values[:, :, source_modality:source_modality + 1]
         length = keys.shape[1]
@@ -418,9 +419,9 @@ class AttentionGraphLayer(nn.Module):
             adjacency = adjacency_from_neighbors(diff, same, valid, self.window)
         else:
             adjacency = mask_dense_adjacency(adjacency, valid, self.window)
-        normed = {m: self.pre_norm[m](H[m]) for m in MODALITIES}
-        keys = torch.stack([self.key[m](normed[m]) for m in MODALITIES], 2)
-        values = torch.stack([self.value[m](normed[m]) for m in MODALITIES], 2)
+        normed = {m: self.pre_norm[m](H[m]) for m in self.modalities}
+        keys = torch.stack([self.key[m](normed[m]) for m in self.modalities], 2)
+        values = torch.stack([self.value[m](normed[m]) for m in self.modalities], 2)
         diff_mask = adjacency['diff'].reshape(B * N, N)
         same_mask = adjacency['same'].reshape(B * N, N)
         adjacent_mask = adjacency['adjacent'].any(-1).reshape(-1)
@@ -441,7 +442,7 @@ class AttentionGraphLayer(nn.Module):
                 'shared_scan_token_count': ((diff_mask.any(-1).long() + same_mask.any(-1).long()
                     + adjacent_mask.long() + 1) * valid.reshape(-1).long()).reshape(B, N).detach()}
         result = {}
-        for m in MODALITIES:
+        for m in self.modalities:
             queries = self.query[m](normed[m]).reshape(B * N, d)
             read = (self.read_proj[m](normed[m]) + self.read_embedding[m]).reshape(B * N, d)
             if self.adjacent_source == "updated":
@@ -476,7 +477,7 @@ class AttentionGraphEncoder(nn.Module):
         super().__init__()
         self.window = cfg.local_window
         self.layers = nn.ModuleList([AttentionGraphLayer(cfg) for _ in range(cfg.graph_layers)])
-        self.final_norm = nn.ModuleDict({m: nn.LayerNorm(cfg.hidden) for m in MODALITIES})
+        self.final_norm = nn.ModuleDict({m: nn.LayerNorm(cfg.hidden) for m in cfg.modalities})
 
     def forward(self, H, diff, same, valid, *, speakers=None, adjacency=None):
         # Build structural matrices once per encoder call, reuse across layers.
@@ -489,4 +490,4 @@ class AttentionGraphEncoder(nn.Module):
         for index, layer in enumerate(self.layers):
             H, diagnostics[index] = layer(H, diff, same, valid, adjacency=adjacency)
         mask = valid.unsqueeze(-1)
-        return {m: self.final_norm[m](H[m]) * mask.to(H[m].dtype) for m in MODALITIES}, diagnostics
+        return {m: norm(H[m]) * mask.to(H[m].dtype) for m, norm in self.final_norm.items()}, diagnostics
