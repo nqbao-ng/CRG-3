@@ -3,12 +3,8 @@ from math import isfinite
 
 
 GRAPH_UPDATE_MODES = ("attention_joint",)
-TEXT_ANCHORED_GMU_MODES = ("gmu_text_anchor_concat", "gmu_text_anchor_interaction_concat")
-FUSION_MODES = ("gmu_pairwise_concat", *TEXT_ANCHORED_GMU_MODES)
-_BASELINE_READOUTS = ("sum", "concat")  # Saved baseline checkpoints.
-JOINT_SSM_FUSION_MODES = ("off", "gated")
+FUSION_MODES = ("concat", "text_anchor_spatial_concat", "tav_anchor_spatial_concat")
 ATTENTION_HISTORY_SCOPES = ("joint", "intra")
-ROLE_SCAN_MODES = ("forward", "sequential", "cagmamba")
 INPUT_MODALITY_MODES = ("tav", "ta")
 
 
@@ -33,14 +29,17 @@ class ModelConfig:
     joint_local_mixer: str = "gmu_tanh_no_uz"
     joint_gate_normalization: str = "sigmoid"  # fixed scalar local gates
     joint_local_kernel: str = "off"  # fixed: no learned lag kernel
-    joint_ssm_fusion: str = "off"  # off | gated; gated_concat is retained for checkpoint loading
-    fusion_mode: str = "gmu_pairwise_concat"
-    gmu_pairwise_product: str = "on"
+    joint_ssm_fusion: str = "off"  # fixed: private SSMs
+    fusion_mode: str = "concat"
+    tav_anchor_all_peers: bool = False  # checkpoint metadata for TAVASC topology
     decoder_mode: InitVar[str] = "classifier"  # accepted only for legacy classifier metadata
-    attention_history_scope: str = "joint"  # joint T/A/V or intra-modality Same/Diff sources
-    role_scan_mode: str = "forward"  # forward | sequential | cagmamba
+    attention_history_scope: str | None = None  # defaults to joint for concat and intra for anchors
+    role_scan_mode: str = "forward"  # fixed: scan in role order
     modality_loss_weight: float = 0.0  # legacy concat checkpoint with modality heads
     modalities: str = "tav"  # ta: legacy Text + Audio baselines
+    speaker_embeddings: bool = False
+    speaker_position_embeddings: bool = False  # legacy speaker + position checkpoints only
+    speaker_embedding_count: int = 0  # resolved from the training dialogues
 
     def __post_init__(self, decoder_mode):
         if self.model_type != "crg3":
@@ -61,14 +60,20 @@ class ModelConfig:
             raise ValueError("attention_pool_reduction must be 'sum', 'mean' or 'modality_mean'")
         if self.attention_score not in ("dot_product", "gat"):
             raise ValueError("attention_score must be 'dot_product' or 'gat'")
-        if self.joint_ssm_fusion not in (*JOINT_SSM_FUSION_MODES, 'gated_concat'):
-            raise ValueError(f"joint_ssm_fusion must be one of {JOINT_SSM_FUSION_MODES}")
+        if self.fusion_mode not in FUSION_MODES:
+            raise ValueError(f"fusion_mode must be one of {FUSION_MODES}")
+        if self.attention_history_scope is None:
+            self.attention_history_scope = "joint" if self.fusion_mode == "concat" else "intra"
         if self.attention_history_scope not in ATTENTION_HISTORY_SCOPES:
             raise ValueError(f"attention_history_scope must be one of {ATTENTION_HISTORY_SCOPES}")
-        if self.role_scan_mode not in ROLE_SCAN_MODES:
-            raise ValueError(f"role_scan_mode must be one of {ROLE_SCAN_MODES}")
-        if self.role_scan_mode != "forward" and self.joint_ssm_fusion != "off":
-            raise ValueError("Bidirectional role scans require joint_ssm_fusion='off'")
+        if self.fusion_mode != "concat" and self.attention_history_scope != "intra":
+            raise ValueError("TASC and TAVASC require intra history. Use the original source for joint-history anchors.")
+        if self.joint_ssm_fusion != "off":
+            raise ValueError("Shared SSM is retired. Use the original experiment source.")
+        if self.role_scan_mode != "forward":
+            raise ValueError("Bidirectional role scan is retired. Use the original experiment source.")
+        if self.tav_anchor_all_peers:
+            raise ValueError("TAVASC with all peers is retired. Use the original experiment source.")
         if self.joint_local_mixer != "gmu_tanh_no_uz":
             raise ValueError("Only the gmu_tanh_no_uz mixer is supported")
         if self.joint_local_kernel != "off" or self.joint_gate_normalization != "sigmoid":
@@ -79,21 +84,17 @@ class ModelConfig:
             raise ValueError("Invalid window or dropout")
         if decoder_mode != "classifier":
             raise ValueError("Only classifier checkpoints are supported")
-        if self.fusion_mode not in (*FUSION_MODES, *_BASELINE_READOUTS):
-            raise ValueError(f"Unsupported readout: {self.fusion_mode}")
-        if self.gmu_pairwise_product not in ("on", "off"):
-            raise ValueError("gmu_pairwise_product must be on or off")
         if self.modalities not in INPUT_MODALITY_MODES:
             raise ValueError(f"modalities must be one of {INPUT_MODALITY_MODES}")
         if self.modalities == "ta" and (self.attention_history_scope != "intra"
-                or self.joint_ssm_fusion != "off"
-                or self.fusion_mode not in ("sum", "concat")):
-            raise ValueError("modalities='ta' requires intra history, shared SSM off, "
-                             "and a sum or concat classifier")
+                or self.fusion_mode != "concat"):
+            raise ValueError("modalities='ta' requires intra history and a concat classifier")
         if not isfinite(self.modality_loss_weight) or self.modality_loss_weight < 0:
             raise ValueError("modality_loss_weight must be finite and nonnegative")
         if self.modality_loss_weight and self.fusion_mode != "concat":
             raise ValueError("Joint modality heads require the concat classifier")
+        if self.speaker_embedding_count < 0:
+            raise ValueError("speaker_embedding_count must be nonnegative")
 
 
 def model_config_from_dict(values):
@@ -151,15 +152,15 @@ def model_config_from_dict(values):
         raise ValueError("This is an older attention_joint checkpoint with two sequential stages. "
                          "Use its archived source; pooled_roles_v1 requires a new trained checkpoint.")
     # A checkpoint written before fusion has no fusion weights and used plain sum.
-    values.setdefault("fusion_mode", "sum")
-    if values["fusion_mode"] not in (*FUSION_MODES, *_BASELINE_READOUTS):
+    if values.get("fusion_mode", "sum") not in FUSION_MODES:
         raise ValueError('This checkpoint uses a removed readout; load its archived source.')
+    if values.get("fusion_mode") == "tav_anchor_spatial_concat":
+        # Older checkpoints have two incoming cross-modal messages per target.
+        values.setdefault("tav_anchor_all_peers", True)
     # These settings were serialized even on checkpoints whose readout never used them.
     for field in ("cross_modal_reduction", "va_loss_weight", "va_targets", "raven_beta",
-                  "symmetric_shift_tau", "digemo_hard_weight", "digemo_distill_weight", "digemo_temperature"):
+                  "symmetric_shift_tau", "digemo_hard_weight", "digemo_distill_weight", "digemo_temperature",
+                  "gmu_pairwise_product", "fafm_residual", "pairwise_ct_candidate_only",
+                  "tav_anchor_skip_all", "tav_anchor_av_skip_count"):
         values.pop(field, None)
-    # Sum checkpoints may carry the former, unused confidence-fusion defaults.
-    if values["fusion_mode"] == "sum":
-        for field in ("fusion_aux_weight", "fusion_alpha_init", "fusion_beta_init"):
-            values.pop(field, None)
     return ModelConfig(**values)

@@ -1,12 +1,40 @@
 """CRG-3: GraphSmile textf0/audio/visual -> causal Graph Mamba -> ERC."""
+from math import log
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from .attention_graph import AttentionGraphEncoder
-from .affect_fusion import PairwiseGMUFusion, TextAnchoredGMUFusion
-from .config import TEXT_ANCHORED_GMU_MODES
+from .affect_fusion import ModalityAnchoredUpdate
 from .graph import MODALITY_FEATURES
+
+
+class SpeakerEmbedding(nn.Module):
+    """Share dialogue-local speaker embeddings across modalities."""
+
+    def __init__(self, hidden, speaker_count, *, legacy_positions=False):
+        super().__init__()
+        if speaker_count < 1:
+            raise ValueError("Speaker embeddings require a positive training speaker count")
+        self.hidden = hidden
+        self.speakers = nn.Embedding(speaker_count + 1, hidden, padding_idx=speaker_count)
+        nn.init.normal_(self.speakers.weight[:-1], std=0.02)
+        frequencies = None
+        if legacy_positions:
+            frequencies = torch.exp(-log(10000.0) * torch.arange(0, hidden, 2, dtype=torch.float32) / hidden)
+        self.register_buffer("frequencies", frequencies, persistent=False)
+
+    def forward(self, speaker_ids, valid):
+        padding_idx = self.speakers.padding_idx
+        known = valid & speaker_ids.ge(0) & speaker_ids.lt(padding_idx)
+        speakers = self.speakers(speaker_ids.masked_fill(~known, padding_idx))
+        if self.frequencies is None:
+            return speakers
+        positions = torch.arange(valid.shape[1], device=valid.device, dtype=torch.float32)
+        angles = positions[:, None] * self.frequencies.float()
+        positional = torch.stack((angles.sin(), angles.cos()), dim=-1).flatten(1)[:, :self.hidden]
+        return speakers + positional.to(speakers.dtype)
 
 
 class CRG3(nn.Module):
@@ -22,15 +50,25 @@ class CRG3(nn.Module):
         })
         self.graph = AttentionGraphEncoder(cfg)
         self.classifier = nn.Sequential(nn.Dropout(cfg.dropout), nn.Linear(d, num_classes))
-        # Keep common encoder weights and the RNG state matched across fusion modes.
+        self.utterance_embeddings = None
+        self.text_anchor_fusion = None
+        self.tav_anchor_fusion = None
+        # Preserve the seeded initialization of the original concat classifier.
         with torch.random.fork_rng(devices=[]):
-            if cfg.fusion_mode != "sum":
-                self.classifier[1] = nn.Linear(len(self.modalities) * d, num_classes)
-                if cfg.fusion_mode == "gmu_pairwise_concat":
-                    self.pairwise_gmu = PairwiseGMUFusion(d, use_product=cfg.gmu_pairwise_product == "on")
-                elif cfg.fusion_mode in TEXT_ANCHORED_GMU_MODES:
-                    self.text_anchored_gmu = TextAnchoredGMUFusion(
-                        d, pair_interaction=cfg.fusion_mode == "gmu_text_anchor_interaction_concat")
+            self.classifier[1] = nn.Linear(len(self.modalities) * d, num_classes)
+        if cfg.fusion_mode == "text_anchor_spatial_concat":
+            with torch.random.fork_rng(devices=[]):
+                self.text_anchor_fusion = ModalityAnchoredUpdate(d, target="t")
+        elif cfg.fusion_mode == "tav_anchor_spatial_concat":
+            with torch.random.fork_rng(devices=[]):
+                self.tav_anchor_fusion = nn.ModuleDict({
+                    m: ModalityAnchoredUpdate(d, target=m, sources=None if m == "t" else ("t",))
+                    for m in self.modalities
+                })
+        if cfg.speaker_embeddings or cfg.speaker_position_embeddings:
+            with torch.random.fork_rng(devices=[]):
+                self.utterance_embeddings = SpeakerEmbedding(
+                    d, cfg.speaker_embedding_count, legacy_positions=cfg.speaker_position_embeddings)
         self.modality_heads = None
         if cfg.modality_loss_weight:
             with torch.random.fork_rng(devices=[]):
@@ -40,30 +78,35 @@ class CRG3(nn.Module):
         """Return one contextual CRG output per active modality, each [B,N,H]."""
         valid = batch["mask"]
         mask = valid.unsqueeze(-1)
-        h = {m: self.input_proj[m](batch[MODALITY_FEATURES[m]]) * mask for m in self.modalities}
+        h = {m: self.input_proj[m](batch[MODALITY_FEATURES[m]]) for m in self.modalities}
+        if self.utterance_embeddings is not None:
+            context = self.utterance_embeddings(batch["speaker"], valid)
+            h = {m: features + context.to(features.dtype) for m, features in h.items()}
+        h = {m: features * mask for m, features in h.items()}
         q, diagnostics = self.graph(h, batch.get("diff"), batch.get("same"), valid,
                                     speakers=batch.get("speaker"),
                                     adjacency=batch.get("adjacency"))
         return q, diagnostics
 
     def _fuse(self, features, valid):
-        if self.cfg.fusion_mode == "gmu_pairwise_concat":
-            return self.pairwise_gmu(features).masked_fill(~valid.unsqueeze(-1), 0)
-        if self.cfg.fusion_mode in TEXT_ANCHORED_GMU_MODES:
-            return self.text_anchored_gmu(features).masked_fill(~valid.unsqueeze(-1), 0)
-        # Plain readouts support saved baseline checkpoints.
-        private = tuple(features[m] for m in self.modalities)
-        if self.cfg.fusion_mode == "sum":
-            return sum(private[1:], private[0])
-        return torch.cat(private, dim=-1)
+        if self.tav_anchor_fusion is not None:
+            fused = torch.cat([update(features) for update in self.tav_anchor_fusion.values()], dim=-1)
+            return fused.masked_fill(~valid.unsqueeze(-1), 0)
+        if self.text_anchor_fusion is not None:
+            fused = torch.cat((self.text_anchor_fusion(features), features["a"], features["v"]), dim=-1)
+            return fused.masked_fill(~valid.unsqueeze(-1), 0)
+        return torch.cat([features[m] for m in self.modalities], dim=-1)
 
     def fused_features(self, batch):
+        """Return the features read by the primary classifier."""
         features, diagnostics = self.modality_features(batch)
         return self._fuse(features, batch["mask"]), diagnostics
 
     def forward(self, batch, return_aux=False):
         q, _ = self.modality_features(batch)
-        logits = self.classifier(self._fuse(q, batch["mask"]))
+        valid = batch["mask"]
+        fused = self._fuse(q, valid)
+        logits = self.classifier(fused)
         if return_aux:
             # Tensor-only dictionary is compatible with DataParallel gather.
             output = {"logits": logits}
@@ -97,10 +140,12 @@ class CRG3(nn.Module):
 
     def encoder_state_dict(self):
         return {name: value for name, value in self.state_dict().items()
-                if name.startswith(("input_proj.", "graph."))}
+                if name.startswith(("input_proj.", "graph.", "utterance_embeddings."))}
 
     def load_encoder_state_dict(self, state):
         modules = [("input_proj.", self.input_proj), ("graph.", self.graph)]
+        if self.utterance_embeddings is not None:
+            modules.append(("utterance_embeddings.", self.utterance_embeddings))
         for prefix, module in modules:
             module.load_state_dict({k[len(prefix):]: v for k, v in state.items()
                                     if k.startswith(prefix)}, strict=True)

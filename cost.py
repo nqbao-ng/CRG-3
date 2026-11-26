@@ -65,12 +65,6 @@ class ForwardCost:
             + 2 * rows * width * modalities)
         self.counts['gat_score_calls'] += 1
 
-    def shared_fusion(self, module, inputs, output):
-        # Three gate multiplications + residual additions; projections and SSM
-        # are already counted by their own hooks. Sigmoid remains excluded.
-        self.counts['shared_fusion_flops'] += 2 * sum(value.numel() for value in output.values())
-        self.counts['shared_fusion_calls'] += 1
-
     def __enter__(self):
         for module in self.model.modules():
             if isinstance(module, nn.Linear):
@@ -83,8 +77,6 @@ class ForwardCost:
                 self.handles.append(module.register_forward_hook(self.gated_local))
             elif isinstance(module, attention_graph.AdditiveRelationScorer):
                 self.handles.append(module.register_forward_hook(self.additive_score))
-            elif isinstance(module, attention_graph.GatedSharedRoleSSM):
-                self.handles.append(module.register_forward_hook(self.shared_fusion))
         self.original_attention = attention_graph.attention_messages
 
         def counted_attention(query, keys, values, mask, normalization='joint', *, scores=None):
@@ -130,6 +122,6 @@ class ForwardCost:
         result = dict(self.counts)
         result['total_major_arithmetic_flops'] = sum(self.counts[k] for k in (
             'linear_flops', 'conv1d_flops', 'attention_flops', 'scan_arithmetic_flops',
-            'gated_local_flops', 'adjacency_flops', 'shared_fusion_flops'))
+            'gated_local_flops', 'adjacency_flops'))
         result['gflops'] = result['total_major_arithmetic_flops'] / 1e9
         return result

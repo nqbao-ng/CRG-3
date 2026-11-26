@@ -3,7 +3,7 @@
 Each nonempty relation uses joint softmax + sum, separate softmax per modality
 + mean of modality contexts, or legacy joint softmax + source-count mean.
 Both groups read the same layer-input snapshot. Each modality uses a kernel-free
-gated tanh SSM, with optional sequential or aligned bidirectional readout.
+gated tanh SSM with a forward role scan.
 Missing roles are compacted out; scan state resets per target. No future input.
 Adjacent can use the input snapshot (A), or the previous updated node in this
 same layer (B). B preserves gradient through the node chain; groups still use H.
@@ -17,8 +17,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .graph import MODALITIES, GateUpdate
-from .gated_local import DirectGatedRoleSSMBlock, DirectGatedRoleSSMMixer
+from .graph import GateUpdate
+from .gated_local import DirectGatedRoleSSMBlock
 from .adjacency import (adjacency_from_neighbors, build_speaker_adjacency,
                         mask_dense_adjacency)
 
@@ -110,50 +110,12 @@ def pack_role_tokens(tokens, present):
     return packed, present.sum(1) - 1
 
 
-def reverse_packed_roles(sequence, read_position):
-    """Reverse only the valid prefix, keeping Target first and padding last."""
-    positions = read_position[:, None] - torch.arange(sequence.shape[1], device=sequence.device)
-    reversed_roles = sequence.gather(1, positions.clamp_min(0).unsqueeze(-1).expand_as(sequence))
-    return reversed_roles.masked_fill(positions.unsqueeze(-1) < 0, 0)
-
-
 def dense_adjacent_features(adjacency, features):
     """A_adj @ H within one modality; A_adj is constrained to its subdiagonal."""
     # Preserve the source dtype: AMP must not introduce an extra cast before
     # the existing adjacent projection compared with the former shifted H.
     with torch.autocast(device_type=features.device.type, enabled=False):
         return torch.bmm(adjacency.to(features.dtype), features)
-
-
-class GatedSharedRoleSSM(nn.Module):
-    """Aligned T/A/V roles -> one shared SSM -> gated residual per modality.
-
-    X_p concatenates the three modalities at role p and projects to hidden.
-    Historical full-width checkpoints omit that projection. J is the shared
-    SSM's Target output.
-    C_m = P_m J, F_m = U_m + sigmoid(W_gm [U_m; C_m] + b_gm) * C_m.
-    This is a CRG adaptation inspired by GCMN, not its bidirectional BSSM.
-    """
-    def __init__(self, hidden, d_state, d_conv, *, project_input=True):
-        super().__init__()
-        concat_width = len(MODALITIES) * hidden
-        scan_width = hidden if project_input else concat_width
-        self.joint_proj = nn.Linear(concat_width, hidden, bias=False) if project_input else nn.Identity()
-        self.shared_scan = DirectGatedRoleSSMBlock(scan_width, d_state, d_conv)
-        self.cross_proj = nn.ModuleDict({m: nn.Linear(scan_width, hidden, bias=False)
-                                        for m in MODALITIES})
-        self.fusion_gate = nn.ModuleDict({m: nn.Linear(2 * hidden, hidden)
-                                         for m in MODALITIES})
-
-    def forward(self, private, sequences, read_position):
-        combined = self.joint_proj(torch.cat([sequences[m] for m in MODALITIES], dim=-1))
-        joint = self.shared_scan(combined, read_position)
-        result = {}
-        for m in MODALITIES:
-            cross = self.cross_proj[m](joint)
-            gate = torch.sigmoid(self.fusion_gate[m](torch.cat([private[m], cross], dim=-1)))
-            result[m] = private[m] + gate * cross
-        return result
 
 
 class AttentionGraphLayer(nn.Module):
@@ -169,8 +131,6 @@ class AttentionGraphLayer(nn.Module):
         self.attention_score = cfg.attention_score
         self.history_scope = cfg.attention_history_scope
         self.modalities = tuple(cfg.modalities)
-        self.role_scan_mode = cfg.role_scan_mode
-        self.joint_ssm_fusion = cfg.joint_ssm_fusion
         # Q/K/V projections are shared BETWEEN groups within this layer, while
         # each group has its own softmax denominator and role embedding.
         self.pre_norm = nn.ModuleDict({m: nn.LayerNorm(d) for m in self.modalities})
@@ -200,25 +160,6 @@ class AttentionGraphLayer(nn.Module):
             # Separate from the retained post-pooling relation embeddings.
             self.score_relation_embedding = nn.ParameterDict({
                 r: nn.Parameter(torch.zeros(d)) for r in ('diff', 'same')})
-        if self.joint_ssm_fusion != 'off':
-            # Preserve common weights and subsequent-layer RNG for matched controls.
-            with torch.random.fork_rng(devices=[]):
-                self.shared_fusion = GatedSharedRoleSSM(
-                    d, cfg.d_state, cfg.d_conv,
-                    project_input=self.joint_ssm_fusion == 'gated',
-                )
-        if self.role_scan_mode != 'forward':
-            # Keep the forward baseline's initialization under the same seed.
-            with torch.random.fork_rng(devices=[]):
-                if self.role_scan_mode == 'sequential':
-                    self.reverse_scan = nn.ModuleDict({m: DirectGatedRoleSSMBlock(
-                        d, cfg.d_state, cfg.d_conv) for m in self.modalities})
-                    self.reverse_update = nn.ModuleDict({m: GateUpdate(
-                        d, cfg.dropout, use_gate=cfg.graph_gate == 'on') for m in self.modalities})
-                else:
-                    self.reverse_scan = nn.ModuleDict({m: DirectGatedRoleSSMMixer(
-                        d, cfg.d_state, cfg.d_conv, output_projection=False) for m in self.modalities})
-                    self.bssm_gate = nn.ModuleDict({m: nn.Linear(d, d) for m in self.modalities})
 
     def _role_rows(self, query, keys, values, target_rows, diff_mask, same_mask,
                    adjacent, adjacent_mask, read, modality):
@@ -266,118 +207,14 @@ class AttentionGraphLayer(nn.Module):
     def _scan_rows(self, *args):
         sequence, read_position = self._role_rows(*args)
         modality = args[-1]
-        forward = self.scan[modality]
-        if self.role_scan_mode == 'cagmamba':
-            normalized = forward.norm(sequence)
-            target = normalized[torch.arange(normalized.shape[0], device=normalized.device),
-                                read_position]
-            forward_target = forward.mixer(normalized, read_position, project=False)
-            # Target aligns with step zero of the reversed valid prefix.
-            backward_roles = reverse_packed_roles(normalized, read_position)
-            backward_target = self.reverse_scan[modality](backward_roles)[:, 0]
-            gate = F.silu(self.bssm_gate[modality](target))
-            return forward.mixer.out_proj(gate * (forward_target * backward_target))
-        return forward(sequence, read_position)
-
-    def _scan_chunk(self, H, inputs):
-        if self.role_scan_mode != 'sequential':
-            return self._scan_rows(*inputs)
-        rows, modality = inputs[3], inputs[-1]
-        node = H.reshape(-1, H.shape[-1])[rows]
-        sequence, read_position = self._role_rows(*inputs)
-        forward_context = self.scan[modality](sequence, read_position)
-        valid = torch.ones_like(read_position, dtype=torch.bool)
-        updated = self.update[modality](node, forward_context, valid)
-        backward_roles = reverse_packed_roles(sequence, read_position)
-        backward_roles = torch.cat([updated.unsqueeze(1), backward_roles[:, 1:]], dim=1)
-        reverse = self.reverse_scan[modality]
-        backward_context = reverse.mixer(reverse.norm(backward_roles), read_position)
-        return self.reverse_update[modality](updated, backward_context, valid)
+        return self.scan[modality](sequence, read_position)
 
     def _finish_scan_rows(self, node, valid, rows, chunks, modality):
-        updated_in_chunk = self.role_scan_mode == 'sequential'
         flat_node = node.reshape(-1, node.shape[-1])
-        output = flat_node if updated_in_chunk else torch.zeros_like(flat_node)
+        output = torch.zeros_like(flat_node)
         if chunks:
             output = output.index_copy(0, rows, torch.cat(chunks).to(output.dtype))
-        output = output.reshape_as(node)
-        if updated_in_chunk:
-            return output * valid.unsqueeze(-1).to(output.dtype)
-        return self.update[modality](node, output, valid)
-
-    def _fused_context_rows(self, rows, queries, keys, values, diff_mask,
-                            same_mask, adjacent, adjacent_mask, read):
-        sequences, private = {}, {}
-        read_position = None
-        for m in MODALITIES:
-            sequence, read_position = self._role_rows(
-                queries[m][rows], keys, values, rows, diff_mask[rows],
-                same_mask[rows], adjacent[m], adjacent_mask[rows], read[m][rows], m)
-            sequences[m] = sequence
-            # Old private streams bypass targets with no historical roles.
-            # Keep that behavior; the new shared stream can still fuse T/A/V there.
-            selected = (read_position > 0).nonzero(as_tuple=True)[0]
-            context = sequence.new_zeros(len(rows), sequence.shape[-1])
-            if selected.numel():
-                context = context.index_copy(0, selected,
-                    self.scan[m](sequence[selected], read_position[selected]))
-            private[m] = context
-        # Structural masks are common across modalities, so packing aligns roles.
-        return self.shared_fusion(private, sequences, read_position)
-
-    def _forward_fused(self, H, valid, normed, queries, keys, values, diff_mask,
-                       same_mask, adjacent_mask, read, adjacency):
-        """Four streams; updated Adjacent advances all modalities in lockstep."""
-        B, N, d = H['t'].shape
-        if self.adjacent_source == 'input':
-            adjacent = {m: self.adjacent_proj[m](dense_adjacent_features(
-                adjacency['adjacent'], normed[m])).reshape(B * N, d) for m in MODALITIES}
-            rows = valid.reshape(-1).nonzero(as_tuple=True)[0]
-            pieces = {m: [] for m in MODALITIES}
-            for chunk in rows.split(self.chunk_size):
-                if not chunk.numel():
-                    continue
-                contexts = self._fused_context_rows(chunk, queries, keys, values,
-                    diff_mask, same_mask, {m: adjacent[m][chunk] for m in MODALITIES},
-                    adjacent_mask, read)
-                for m in MODALITIES:
-                    pieces[m].append(contexts[m])
-            result = {}
-            for m in MODALITIES:
-                context = H[m].new_zeros(B * N, d)
-                if pieces[m]:
-                    context = context.index_copy(0, rows, torch.cat(pieces[m]).to(context.dtype))
-                result[m] = self.update[m](H[m], context.reshape(B, N, d), valid)
-            return result
-
-        previous = {m: H[m].new_zeros(B, d) for m in MODALITIES}
-        nodes = {m: [] for m in MODALITIES}
-        offsets = torch.arange(B, device=valid.device) * N
-        for time in range(N):
-            all_rows = offsets + time
-            rows = all_rows[valid[:, time]]
-            adjacent = {m: self.adjacent_proj[m](self.pre_norm[m](previous[m]))
-                        for m in MODALITIES}
-            pieces = {m: [] for m in MODALITIES}
-            for chunk in rows.split(self.chunk_size):
-                if not chunk.numel():
-                    continue
-                b = torch.div(chunk, N, rounding_mode='floor')
-                contexts = self._fused_context_rows(chunk, queries, keys, values,
-                    diff_mask, same_mask, {m: adjacent[m][b] for m in MODALITIES},
-                    adjacent_mask, read)
-                for m in MODALITIES:
-                    pieces[m].append(contexts[m])
-            current = {}
-            b = torch.div(rows, N, rounding_mode='floor')
-            for m in MODALITIES:
-                context = H[m].new_zeros(B, d)
-                if pieces[m]:
-                    context = context.index_copy(0, b, torch.cat(pieces[m]).to(context.dtype))
-                current[m] = self.update[m](H[m][:, time], context, valid[:, time])
-                nodes[m].append(current[m])
-            previous = current  # Keep gradients; all m advance after this target.
-        return {m: torch.stack(nodes[m], dim=1) for m in MODALITIES}
+        return self.update[modality](node, output.reshape_as(node), valid)
 
     def _updated_adjacent_nodes(self, H, valid, queries, keys, values, diff_mask,
                                 same_mask, adjacent_mask, read, active, modality):
@@ -405,7 +242,7 @@ class AttentionGraphLayer(nn.Module):
                 inputs = (queries[chunk], keys, values, chunk, diff_mask[chunk],
                           same_mask[chunk], adjacent[dialogue_rows],
                           adjacent_mask[chunk], read[chunk], modality)
-                chunks.append(self._scan_chunk(H, inputs))
+                chunks.append(self._scan_rows(*inputs))
             dialogue_rows = torch.div(rows, N, rounding_mode='floor')
             current = self._finish_scan_rows(H[:, time], valid[:, time], dialogue_rows,
                                              chunks, modality)
@@ -426,21 +263,14 @@ class AttentionGraphLayer(nn.Module):
         same_mask = adjacency['same'].reshape(B * N, N)
         adjacent_mask = adjacency['adjacent'].any(-1).reshape(-1)
         active = (diff_mask.any(-1) | same_mask.any(-1) | adjacent_mask) & valid.reshape(-1)
+        role_count = diff_mask.any(-1).long() + same_mask.any(-1).long() + adjacent_mask.long() + 1
+        diagnostics = {
+            'diff': {'neighbor_count': diff_mask.sum(-1).reshape(B, N).detach()},
+            'same': {'neighbor_count': same_mask.sum(-1).reshape(B, N).detach()},
+            'adjacent_present': adjacent_mask.reshape(B, N).detach(),
+            'scan_token_count': (role_count * active).reshape(B, N).detach(),
+        }
         rows = active.nonzero(as_tuple=True)[0]
-        if self.joint_ssm_fusion != 'off':
-            queries = {m: self.query[m](normed[m]).reshape(B * N, d) for m in MODALITIES}
-            read = {m: (self.read_proj[m](normed[m]) + self.read_embedding[m]).reshape(B * N, d)
-                    for m in MODALITIES}
-            result = self._forward_fused(H, valid, normed, queries, keys, values,
-                                        diff_mask, same_mask, adjacent_mask, read, adjacency)
-            return result, {
-                'diff': {'neighbor_count': diff_mask.sum(-1).reshape(B, N).detach()},
-                'same': {'neighbor_count': same_mask.sum(-1).reshape(B, N).detach()},
-                'adjacent_present': adjacent_mask.reshape(B, N).detach(),
-                'scan_token_count': ((diff_mask.any(-1).long() + same_mask.any(-1).long()
-                    + adjacent_mask.long() + 1) * active.long()).reshape(B, N).detach(),
-                'shared_scan_token_count': ((diff_mask.any(-1).long() + same_mask.any(-1).long()
-                    + adjacent_mask.long() + 1) * valid.reshape(-1).long()).reshape(B, N).detach()}
         result = {}
         for m in self.modalities:
             queries = self.query[m](normed[m]).reshape(B * N, d)
@@ -460,16 +290,9 @@ class AttentionGraphLayer(nn.Module):
                 inputs = (queries[chunk], keys, values, chunk, diff_mask[chunk],
                           same_mask[chunk], adjacent[chunk],
                           adjacent_mask[chunk], read[chunk], m)
-                chunks.append(self._scan_chunk(H[m], inputs))
+                chunks.append(self._scan_rows(*inputs))
             result[m] = self._finish_scan_rows(H[m], valid, rows, chunks, m)
-        counts_d = diff_mask.sum(-1).reshape(B, N)
-        counts_s = same_mask.sum(-1).reshape(B, N)
-        token_count = (diff_mask.any(-1).long() + same_mask.any(-1).long()
-                       + adjacent_mask.long() + 1) * active.long()
-        return result, {'diff': {'neighbor_count': counts_d.detach()},
-                        'same': {'neighbor_count': counts_s.detach()},
-                        'adjacent_present': adjacent_mask.reshape(B, N).detach(),
-                        'scan_token_count': token_count.reshape(B, N).detach()}
+        return result, diagnostics
 
 
 class AttentionGraphEncoder(nn.Module):

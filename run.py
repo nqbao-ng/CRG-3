@@ -5,6 +5,7 @@ import json
 import random
 import time
 from dataclasses import asdict, fields
+from math import isfinite
 from pathlib import Path
 
 import numpy as np
@@ -14,11 +15,14 @@ from sklearn.metrics import accuracy_score, f1_score
 from torch.utils.data import DataLoader, Subset, SubsetRandomSampler
 
 from CRG3.config import (ModelConfig, GRAPH_UPDATE_MODES, FUSION_MODES,
-                         ATTENTION_HISTORY_SCOPES, JOINT_SSM_FUSION_MODES,
-                         ROLE_SCAN_MODES, model_config_from_dict)
-from CRG3.data import (Collator, GraphSmileDataset, NUM_CLASSES, to_device,
+                         ATTENTION_HISTORY_SCOPES, model_config_from_dict)
+from CRG3.data_loader import (Collator, GraphSmileDataset, NUM_CLASSES, to_device,
                        split_train_validation, session_id)
 from CRG3.model import CRG3, build_model
+
+
+_CHECKPOINT_ONLY_FIELDS = ("modality_loss_weight", "speaker_embedding_count",
+                           "speaker_position_embeddings", "tav_anchor_all_peers")
 
 
 def parse_args(argv=None):
@@ -30,8 +34,12 @@ def parse_args(argv=None):
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--loss_type", choices=("ce", "focal"), default="ce",
+                        help="Training objective for the emotion classifier. Evaluation reports CE.")
+    parser.add_argument("--focal_gamma", type=float, default=2.0,
+                        help="Focusing exponent for focal loss. Zero recovers cross-entropy.")
     parser.add_argument("--class_weighting", choices=["none", "inverse_sqrt"], default="none",
-                        help="Training CE class weights computed only from the selected train dialogues")
+                        help="Training class weights computed only from the selected train dialogues")
     parser.add_argument("--seed", type=int, default=2024)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
@@ -54,16 +62,15 @@ def parse_args(argv=None):
     parser.add_argument("--multi_gpu", action="store_true", help="Use all visible CUDA GPUs with DataParallel")
     for field in fields(ModelConfig):
         name = field.name
-        if name == "modality_loss_weight":
-            continue  # Legacy concat checkpoint metadata.
+        if name in _CHECKPOINT_ONLY_FIELDS:
+            continue  # Checkpoint metadata, not a training argument.
         options = {}
         if name == "graph_update_mode":
             options["choices"] = GRAPH_UPDATE_MODES
         if name == "fusion_mode":
             options["choices"] = FUSION_MODES
-        if name == "gmu_pairwise_product":
-            options.update(choices=("on", "off"),
-                           help="Include the projected elementwise product in each GMU candidate")
+        if name == "speaker_embeddings":
+            options["help"] = "Add a trainable dialogue-local speaker vector to each projected modality"
         if name == "modalities":
             options.update(choices=("tav",), help="Use Text, Audio and Visual for fusion")
         if name == "attention_adjacent_source":
@@ -73,11 +80,11 @@ def parse_args(argv=None):
         if name == "attention_score":
             options["choices"] = ("dot_product", "gat")
         if name == "attention_history_scope":
-            options["choices"] = ATTENTION_HISTORY_SCOPES
-        if name == "joint_ssm_fusion":
-            options["choices"] = JOINT_SSM_FUSION_MODES
-        if name == "role_scan_mode":
-            options["choices"] = ROLE_SCAN_MODES
+            parser.add_argument("--attention_history_scope", choices=ATTENTION_HISTORY_SCOPES,
+                                help="Defaults to joint for concat and intra for TASC and TAVASC")
+            continue
+        if name in ("joint_ssm_fusion", "role_scan_mode"):
+            options.update(choices=(field.default,), help=argparse.SUPPRESS)
         if name == "joint_local_mixer":
             options["choices"] = ("gmu_tanh_no_uz",)
         if name == "joint_gate_normalization":
@@ -89,7 +96,7 @@ def parse_args(argv=None):
         if name in ("model_type", "message_mode", "graph_rmsnorm"):
             options["choices"] = (field.default,)
         if isinstance(field.default, bool):
-            parser.add_argument(f"--{name}", action=argparse.BooleanOptionalAction, default=field.default)
+            parser.add_argument(f"--{name}", action=argparse.BooleanOptionalAction, default=field.default, **options)
         else:
             parser.add_argument(f"--{name}", type=type(field.default), default=field.default, **options)
     args = parser.parse_args(argv)
@@ -97,12 +104,14 @@ def parse_args(argv=None):
         parser.error("epochs, batch_size, hidden and graph_layers must be positive")
     if args.local_window < 0:
         parser.error("local_window must be nonnegative")
+    if not isfinite(args.focal_gamma) or args.focal_gamma < 0:
+        parser.error("focal_gamma must be finite and nonnegative")
     if args.message_mode not in ("projection", "embedding"):
         parser.error("message_mode must be 'projection' or 'embedding'")
     if args.graph_rmsnorm not in ("on", "off"):
         parser.error("graph_rmsnorm must be 'on' or 'off'")
     try:
-        config_from_args(args)
+        args.attention_history_scope = config_from_args(args).attention_history_scope
     except ValueError as error:
         parser.error(str(error))
     if not 0 <= args.valid_ratio < 1:
@@ -118,9 +127,13 @@ def parse_args(argv=None):
     return args
 
 
-def config_from_args(args):
+def config_from_args(args, *, train_loader=None):
     config = {field.name: getattr(args, field.name) for field in fields(ModelConfig)
-              if field.name != "modality_loss_weight"}
+              if field.name not in _CHECKPOINT_ONLY_FIELDS}
+    if args.speaker_embeddings and train_loader is not None:
+        config["speaker_embedding_count"] = max(
+            max(train_loader.dataset[index]["speaker"]) for index in train_loader.sampler.indices
+        ) + 1
     return ModelConfig(**config)
 
 
@@ -229,6 +242,35 @@ def get_class_weights(train_loader, num_classes, device, weighting="none"):
     return torch.tensor(weights, dtype=torch.float32, device=device), counts.tolist()
 
 
+class FocalLoss(torch.nn.Module):
+    """Multiclass focal loss from logits and ground-truth class indices."""
+
+    def __init__(self, gamma, weight=None):
+        super().__init__()
+        self.gamma = gamma
+        self.register_buffer("weight", weight)
+
+    def forward(self, logits, targets):
+        if self.gamma == 0:
+            return F.cross_entropy(logits, targets, weight=self.weight)
+        cross_entropy = F.cross_entropy(logits, targets, reduction="none")
+        # Compute 1 - p_true before applying optional class weights.
+        error_probability = (-torch.expm1(-cross_entropy)).clamp_min(torch.finfo(cross_entropy.dtype).tiny)
+        losses = error_probability.pow(self.gamma) * cross_entropy
+        if self.weight is None:
+            return losses.mean()
+        weights = self.weight[targets]
+        return (losses * weights).sum() / weights.sum()
+
+
+def build_train_loss(args, class_weights):
+    if args.loss_type == "focal":
+        return FocalLoss(args.focal_gamma, weight=class_weights)
+    if class_weights is not None:
+        return torch.nn.CrossEntropyLoss(weight=class_weights)
+    return F.cross_entropy
+
+
 def train_or_eval_graph_model(model, loss_function, dataloader, epoch, device,
                               autocast, optimizer=None, train=False, max_grad_norm=1.0):
     """One CRG-3 pass; report utterance-level emotion metrics."""
@@ -238,7 +280,7 @@ def train_or_eval_graph_model(model, loss_function, dataloader, epoch, device,
         model.train()
     else:
         model.eval()
-    ce_sum, ce_denominator, modality_sum, n_utterances = 0.0, 0.0, 0.0, 0
+    classification_sum, loss_denominator, modality_sum, n_utterances = 0.0, 0.0, 0.0, 0
     core = model.module if isinstance(model, torch.nn.DataParallel) else model
     use_aux = train and core.modality_heads is not None
     labels, preds = [], []
@@ -262,8 +304,8 @@ def train_or_eval_graph_model(model, loss_function, dataloader, epoch, device,
             class_weights = getattr(loss_function, "weight", None)
             batch_denominator = (float(class_weights[batch["label"][mask]].sum().item())
                                  if class_weights is not None else count)
-            ce_sum += float(losses["classification_loss"].item()) * batch_denominator
-            ce_denominator += batch_denominator
+            classification_sum += float(losses["classification_loss"].item()) * batch_denominator
+            loss_denominator += batch_denominator
             if use_aux:
                 modality_sum += float(losses["modality_loss"].item()) * batch_denominator
             n_utterances += count
@@ -275,16 +317,16 @@ def train_or_eval_graph_model(model, loss_function, dataloader, epoch, device,
 
     if n_utterances == 0:
         raise ValueError("Empty dataloader")
-    ce_mean = ce_sum / ce_denominator
-    metrics = {"loss": ce_mean,
+    classification_mean = classification_sum / loss_denominator
+    metrics = {"loss": classification_mean,
             "accuracy": 100 * accuracy_score(labels, preds),
             "weighted_f1": 100 * f1_score(labels, preds, average="weighted", zero_division=0),
             "macro_f1": 100 * f1_score(labels, preds, average="macro", zero_division=0),
             "n_utterances": n_utterances}
     if use_aux:
-        modality_mean = modality_sum / ce_denominator
-        metrics.update(loss=ce_mean + core.cfg.modality_loss_weight * modality_mean,
-                       classification_loss=ce_mean, modality_loss=modality_mean)
+        modality_mean = modality_sum / loss_denominator
+        metrics.update(loss=classification_mean + core.cfg.modality_loss_weight * modality_mean,
+                       classification_loss=classification_mean, modality_loss=modality_mean)
     return metrics
 
 
@@ -312,8 +354,7 @@ def main(argv=None):
     elif args.dataset == "MELD":
         train_loader, valid_loader, test_loader = get_MELD_loaders(**loader_kwargs)
     else:
-        train_loader, valid_loader, test_loader = get_IEMOCAP_loaders(
-            **loader_kwargs, dataset=args.dataset)
+        train_loader, valid_loader, test_loader = get_IEMOCAP_loaders(**loader_kwargs, dataset=args.dataset)
     train_data = train_loader.dataset
     has_validation = valid_loader is not None
     split_sizes = (len(train_loader.sampler),
@@ -321,9 +362,8 @@ def main(argv=None):
                    len(test_loader.dataset))
     class_weights, class_counts = get_class_weights(
         train_loader, train_data.num_classes, device, args.class_weighting)
-    train_loss_function = (torch.nn.CrossEntropyLoss(weight=class_weights)
-                           if class_weights is not None else F.cross_entropy)
-    cfg = config_from_args(args)
+    train_loss_function = build_train_loss(args, class_weights)
+    cfg = config_from_args(args, train_loader=train_loader)
     model = build_model(cfg, train_data.feature_dims, train_data.num_classes).to(device)
     if args.multi_gpu:
         if device.type != "cuda" or torch.cuda.device_count() < 2:
@@ -359,7 +399,8 @@ def main(argv=None):
               "lr_scheduler_active": scheduler is not None,
               "early_stopping_active": bool(args.patience and has_validation),
               "epochs": history}
-    print(f"CRG3 | {args.dataset} | {cfg.graph_update_mode} | fusion={cfg.fusion_mode} | device={device} | "
+    objective = f"focal(gamma={args.focal_gamma:g})" if args.loss_type == "focal" else "ce"
+    print(f"CRG3 | {args.dataset} | {cfg.graph_update_mode} | fusion={cfg.fusion_mode} | loss={objective} | device={device} | "
           "scan=PyTorch | "
           f"train={split_sizes[0]} val={split_sizes[1]} test={split_sizes[2]} | selection={selection}", flush=True)
     def synchronize():

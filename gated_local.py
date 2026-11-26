@@ -48,26 +48,25 @@ class DirectGatedRoleSSMMixer(SelectiveStateSpace):
     Only the target is projected when read_position is supplied. There is no
     split input projection, output z gate, learned local kernel or expansion.
     """
-    def __init__(self, d_model, d_state=16, d_conv=4, *, output_projection=True):
+    def __init__(self, d_model, d_state=16, d_conv=4):
         nn.Module.__init__(self)
         self.d_inner, self.d_state = d_model, d_state
         self.dt_rank = math.ceil(d_model / 16)
         # Preserve historical seeded initialization. This temporary tensor only
         # advances RNG; it is never a parameter or part of the forward graph.
         nn.init.kaiming_uniform_(torch.empty(2 * d_model, d_model), a=math.sqrt(5))
-        self.out_proj = (nn.Linear(d_model, d_model, bias=False)
-                         if output_projection else nn.Identity())
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
         # Preserve the original bias draw and RNG order without registering a
         # convolution. Its weights are discarded; no convolution runs at runtime.
         initial_local = nn.Conv1d(d_model, d_model, d_conv, groups=d_model, padding=d_conv - 1)
         self._init_state_parameters()
         self.local = GatedLocalMixer(d_model, d_conv, initial_local.bias)
 
-    def forward(self, x, read_position=None, *, project=True):
+    def forward(self, x, read_position=None):
         y = self.selective_scan(self.local(x))
         if read_position is not None:
             y = y[torch.arange(y.shape[0], device=y.device), read_position]
-        return self.out_proj(y) if project else y
+        return self.out_proj(y)
 
 
 class DirectGatedRoleSSMBlock(nn.Module):
