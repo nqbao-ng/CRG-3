@@ -3,7 +3,7 @@ from math import isfinite
 
 
 GRAPH_UPDATE_MODES = ("attention_joint",)
-FUSION_MODES = ("concat", "text_anchor_spatial_concat", "tav_anchor_spatial_concat")
+FUSION_MODES = ("concat",)
 ATTENTION_HISTORY_SCOPES = ("joint", "intra")
 INPUT_MODALITY_MODES = ("tav", "ta")
 
@@ -29,11 +29,10 @@ class ModelConfig:
     joint_local_mixer: str = "gmu_tanh_no_uz"
     joint_gate_normalization: str = "sigmoid"  # fixed scalar local gates
     joint_local_kernel: str = "off"  # fixed: no learned lag kernel
-    joint_ssm_fusion: str = "off"  # fixed: private SSMs
+    joint_ssm_fusion: str = "off"  # fixed checkpoint metadata for private role scans
     fusion_mode: str = "concat"
-    tav_anchor_all_peers: bool = False  # checkpoint metadata for TAVASC topology
     decoder_mode: InitVar[str] = "classifier"  # accepted only for legacy classifier metadata
-    attention_history_scope: str | None = None  # defaults to joint for concat and intra for anchors
+    attention_history_scope: str = "joint"
     role_scan_mode: str = "forward"  # fixed: scan in role order
     modality_loss_weight: float = 0.0  # legacy concat checkpoint with modality heads
     modalities: str = "tav"  # ta: legacy Text + Audio baselines
@@ -62,18 +61,14 @@ class ModelConfig:
             raise ValueError("attention_score must be 'dot_product' or 'gat'")
         if self.fusion_mode not in FUSION_MODES:
             raise ValueError(f"fusion_mode must be one of {FUSION_MODES}")
+        if self.joint_ssm_fusion != "off":
+            raise ValueError("Only private role scans (joint_ssm_fusion='off') are supported")
         if self.attention_history_scope is None:
-            self.attention_history_scope = "joint" if self.fusion_mode == "concat" else "intra"
+            self.attention_history_scope = "joint"
         if self.attention_history_scope not in ATTENTION_HISTORY_SCOPES:
             raise ValueError(f"attention_history_scope must be one of {ATTENTION_HISTORY_SCOPES}")
-        if self.fusion_mode != "concat" and self.attention_history_scope != "intra":
-            raise ValueError("TASC and TAVASC require intra history. Use the original source for joint-history anchors.")
-        if self.joint_ssm_fusion != "off":
-            raise ValueError("Shared SSM is retired. Use the original experiment source.")
         if self.role_scan_mode != "forward":
             raise ValueError("Bidirectional role scan is retired. Use the original experiment source.")
-        if self.tav_anchor_all_peers:
-            raise ValueError("TAVASC with all peers is retired. Use the original experiment source.")
         if self.joint_local_mixer != "gmu_tanh_no_uz":
             raise ValueError("Only the gmu_tanh_no_uz mixer is supported")
         if self.joint_local_kernel != "off" or self.joint_gate_normalization != "sigmoid":
@@ -86,13 +81,10 @@ class ModelConfig:
             raise ValueError("Only classifier checkpoints are supported")
         if self.modalities not in INPUT_MODALITY_MODES:
             raise ValueError(f"modalities must be one of {INPUT_MODALITY_MODES}")
-        if self.modalities == "ta" and (self.attention_history_scope != "intra"
-                or self.fusion_mode != "concat"):
-            raise ValueError("modalities='ta' requires intra history and a concat classifier")
+        if self.modalities == "ta" and self.attention_history_scope != "intra":
+            raise ValueError("modalities='ta' requires intra history")
         if not isfinite(self.modality_loss_weight) or self.modality_loss_weight < 0:
             raise ValueError("modality_loss_weight must be finite and nonnegative")
-        if self.modality_loss_weight and self.fusion_mode != "concat":
-            raise ValueError("Joint modality heads require the concat classifier")
         if self.speaker_embedding_count < 0:
             raise ValueError("speaker_embedding_count must be nonnegative")
 
@@ -142,8 +134,8 @@ def model_config_from_dict(values):
     # Before explicit mean pooling, pooled roles used sum(alpha * value).
     values.setdefault("attention_pool_reduction", "sum")
     values.setdefault("attention_score", "dot_product")
-    values.setdefault("attention_history_scope", "joint")
     values.setdefault("joint_ssm_fusion", "off")
+    values.setdefault("attention_history_scope", "joint")
 
     values.setdefault("joint_gate_normalization", "sigmoid")
     values.setdefault("joint_local_kernel", "off")
@@ -154,9 +146,8 @@ def model_config_from_dict(values):
     # A checkpoint written before fusion has no fusion weights and used plain sum.
     if values.get("fusion_mode", "sum") not in FUSION_MODES:
         raise ValueError('This checkpoint uses a removed readout; load its archived source.')
-    if values.get("fusion_mode") == "tav_anchor_spatial_concat":
-        # Older checkpoints have two incoming cross-modal messages per target.
-        values.setdefault("tav_anchor_all_peers", True)
+    if values["joint_ssm_fusion"] != "off" or values.pop("tav_anchor_all_peers", False):
+        raise ValueError('This checkpoint uses a removed fusion architecture; load its archived source.')
     # These settings were serialized even on checkpoints whose readout never used them.
     for field in ("cross_modal_reduction", "va_loss_weight", "va_targets", "raven_beta",
                   "symmetric_shift_tau", "digemo_hard_weight", "digemo_distill_weight", "digemo_temperature",

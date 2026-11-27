@@ -1,11 +1,11 @@
-"""Kernel-free sigmoid-gated tanh mixing followed by a width-preserving SSM."""
+"""Gated Role Scan with sigmoid-gated tanh mixing and selective state recurrence."""
 import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .mamba import SelectiveStateSpace, RMSNorm
+from .state_scan import SelectiveStateScan, RMSNorm
 
 
 class GatedLocalMixer(nn.Module):
@@ -42,7 +42,7 @@ class GatedLocalMixer(nn.Module):
         return (gates.unsqueeze(-1) * features).sum(2) + self.bias.to(u.dtype)
 
 
-class DirectGatedRoleSSMMixer(SelectiveStateSpace):
+class GatedRoleScanMixer(SelectiveStateScan):
     """Normalized roles -> gated tanh mixing -> selective scan -> output projection.
 
     Only the target is projected when read_position is supplied. There is no
@@ -69,15 +69,16 @@ class DirectGatedRoleSSMMixer(SelectiveStateSpace):
         return self.out_proj(y)
 
 
-class DirectGatedRoleSSMBlock(nn.Module):
-    """Keep pre-norm and residual; optionally project only the target output."""
+class GatedRoleScanBlock(nn.Module):
+    """Pre-normalize roles and add the residual to the scan update."""
     def __init__(self, d_model, d_state=16, d_conv=4):
         super().__init__()
         self.norm = RMSNorm(d_model)
-        self.mixer = DirectGatedRoleSSMMixer(d_model, d_state, d_conv)
+        self.mixer = GatedRoleScanMixer(d_model, d_state, d_conv)
 
     def forward(self, x, read_position=None):
+        update = self.mixer(self.norm(x), read_position)
         residual = x
         if read_position is not None:
             residual = x[torch.arange(x.shape[0], device=x.device), read_position]
-        return residual + self.mixer(self.norm(x), read_position)
+        return residual + update

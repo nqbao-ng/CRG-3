@@ -15,14 +15,15 @@ from sklearn.metrics import accuracy_score, f1_score
 from torch.utils.data import DataLoader, Subset, SubsetRandomSampler
 
 from CRG3.config import (ModelConfig, GRAPH_UPDATE_MODES, FUSION_MODES,
-                         ATTENTION_HISTORY_SCOPES, model_config_from_dict)
+                         ATTENTION_HISTORY_SCOPES,
+                         model_config_from_dict)
 from CRG3.data_loader import (Collator, GraphSmileDataset, NUM_CLASSES, to_device,
                        split_train_validation, session_id)
 from CRG3.model import CRG3, build_model
 
 
 _CHECKPOINT_ONLY_FIELDS = ("modality_loss_weight", "speaker_embedding_count",
-                           "speaker_position_embeddings", "tav_anchor_all_peers")
+                           "speaker_position_embeddings")
 
 
 def parse_args(argv=None):
@@ -30,7 +31,7 @@ def parse_args(argv=None):
     parser.add_argument("--data_path", required=True, help="GraphSmile dataset pickle")
     parser.add_argument("--dataset", choices=NUM_CLASSES, default="IEMOCAP")
     parser.add_argument("--out_dir", default="outputs")
-    parser.add_argument("--epochs", type=int, default=120)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
@@ -40,7 +41,7 @@ def parse_args(argv=None):
                         help="Focusing exponent for focal loss. Zero recovers cross-entropy.")
     parser.add_argument("--class_weighting", choices=["none", "inverse_sqrt"], default="none",
                         help="Training class weights computed only from the selected train dialogues")
-    parser.add_argument("--seed", type=int, default=2024)
+    parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--limit_dialogs", type=int, default=0, help="First N dialogues per split for a smoke run")
@@ -68,7 +69,7 @@ def parse_args(argv=None):
         if name == "graph_update_mode":
             options["choices"] = GRAPH_UPDATE_MODES
         if name == "fusion_mode":
-            options["choices"] = FUSION_MODES
+            options.update(choices=FUSION_MODES, help=argparse.SUPPRESS)
         if name == "speaker_embeddings":
             options["help"] = "Add a trainable dialogue-local speaker vector to each projected modality"
         if name == "modalities":
@@ -80,10 +81,11 @@ def parse_args(argv=None):
         if name == "attention_score":
             options["choices"] = ("dot_product", "gat")
         if name == "attention_history_scope":
-            parser.add_argument("--attention_history_scope", choices=ATTENTION_HISTORY_SCOPES,
-                                help="Defaults to joint for concat and intra for TASC and TAVASC")
-            continue
-        if name in ("joint_ssm_fusion", "role_scan_mode"):
+            options.update(choices=ATTENTION_HISTORY_SCOPES,
+                           help="Same/Diff attend to joint (default) or intra-modality history")
+        if name == "joint_ssm_fusion":
+            options.update(choices=(field.default,), help=argparse.SUPPRESS)
+        if name == "role_scan_mode":
             options.update(choices=(field.default,), help=argparse.SUPPRESS)
         if name == "joint_local_mixer":
             options["choices"] = ("gmu_tanh_no_uz",)

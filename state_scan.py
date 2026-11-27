@@ -1,4 +1,4 @@
-"""Selective SSM computed directly in PyTorch on CPU/GPU; no external Mamba kernel."""
+"""Selective state-space recurrence for Gated Role Scan on CPU and GPU."""
 import math
 
 import torch
@@ -17,7 +17,7 @@ class RMSNorm(nn.Module):
         return (xf * self.weight.float()).to(x.dtype)
 
 
-class SelectiveStateSpace(nn.Module):
+class SelectiveStateScan(nn.Module):
     """Input-dependent SSM at the feature width; no u/z branches or expansion."""
 
     def __init__(self, d_model, d_state=16,

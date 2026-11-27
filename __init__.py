@@ -1,2 +1,2 @@
-"""CRG-3: causal relational Graph-Mamba for GraphSmile features."""
+"""CRG-3: causal relational graph learning with Gated Role Scan."""
 

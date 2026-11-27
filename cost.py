@@ -11,7 +11,7 @@ from collections import Counter
 import torch.nn as nn
 
 from . import attention_graph
-from .mamba import SelectiveStateSpace
+from .state_scan import SelectiveStateScan
 from .gated_local import GatedLocalMixer
 
 
@@ -27,8 +27,7 @@ class ForwardCost:
         self.counts['linear_flops'] += 2 * macs + (output.numel() if module.bias is not None else 0)
 
     def conv(self, module, inputs, output):
-        # Count the complete convolution output, including the causal tail that
-        # Mamba subsequently crops. Those output elements are actually computed.
+        # Count every computed convolution output, including padded positions.
         macs = output.numel() * (module.in_channels // module.groups) * module.kernel_size[0]
         self.counts['conv1d_macs'] += macs
         self.counts['conv1d_flops'] += 2 * macs + (output.numel() if module.bias is not None else 0)
@@ -71,7 +70,7 @@ class ForwardCost:
                 self.handles.append(module.register_forward_hook(self.linear))
             elif isinstance(module, nn.Conv1d):
                 self.handles.append(module.register_forward_hook(self.conv))
-            elif isinstance(module, SelectiveStateSpace):
+            elif isinstance(module, SelectiveStateScan):
                 self.handles.append(module.register_forward_hook(self.scan))
             elif isinstance(module, GatedLocalMixer):
                 self.handles.append(module.register_forward_hook(self.gated_local))

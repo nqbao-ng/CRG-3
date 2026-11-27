@@ -2,8 +2,8 @@
 
 Each nonempty relation uses joint softmax + sum, separate softmax per modality
 + mean of modality contexts, or legacy joint softmax + source-count mean.
-Both groups read the same layer-input snapshot. Each modality uses a kernel-free
-gated tanh SSM with a forward role scan.
+Both groups read the same layer-input snapshot. The kernel-free gated tanh SSM
+scans a role sequence separately for each modality.
 Missing roles are compacted out; scan state resets per target. No future input.
 Adjacent can use the input snapshot (A), or the previous updated node in this
 same layer (B). B preserves gradient through the node chain; groups still use H.
@@ -18,7 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .graph import GateUpdate
-from .gated_local import DirectGatedRoleSSMBlock
+from .gated_local import GatedRoleScanBlock
 from .adjacency import (adjacency_from_neighbors, build_speaker_adjacency,
                         mask_dense_adjacency)
 
@@ -143,13 +143,11 @@ class AttentionGraphLayer(nn.Module):
         self.adjacent_embedding = nn.Parameter(torch.zeros(d))
         self.read_proj = nn.ModuleDict({m: nn.Linear(d, d) for m in self.modalities})
         self.read_embedding = nn.ParameterDict({m: nn.Parameter(torch.zeros(d)) for m in self.modalities})
-        self.scan = nn.ModuleDict({m: DirectGatedRoleSSMBlock(
+        self.scan = nn.ModuleDict({m: GatedRoleScanBlock(
             d, cfg.d_state, cfg.d_conv) for m in self.modalities})
         self.update = nn.ModuleDict({m: GateUpdate(d, cfg.dropout) for m in self.modalities})
         if cfg.graph_gate == "off":
-            # Construct identically first so removing gates does not shift the
-            # random initialization of context projections or subsequent layers.
-            # No unused gate parameters remain; W_c/dropout/residual are retained.
+            # Keep the same initialization for the remaining parameters.
             for update in self.update.values():
                 update.gate = None
         if self.attention_score == 'gat':
@@ -161,8 +159,8 @@ class AttentionGraphLayer(nn.Module):
             self.score_relation_embedding = nn.ParameterDict({
                 r: nn.Parameter(torch.zeros(d)) for r in ('diff', 'same')})
 
-    def _role_rows(self, query, keys, values, target_rows, diff_mask, same_mask,
-                   adjacent, adjacent_mask, read, modality):
+    def _pool_relation_rows(self, query, keys, values, target_rows, diff_mask,
+                            same_mask, modality):
         # target_rows are flattened B*N indices. Gather only the chronological
         # interval [i-W, i). Restrict modalities before gathering the window.
         if self.history_scope == 'intra':
@@ -196,25 +194,41 @@ class AttentionGraphLayer(nn.Module):
                                       self.pool_reduction)
             same_h, _ = attention_pool(query, source_keys, source_values, same_mask,
                                       self.pool_reduction)
+        return diff_h, same_h, diff_mask.any(-1), same_mask.any(-1)
+
+    def _pack_roles(self, diff_h, same_h, adjacent, read, diff_present, same_present,
+                    adjacent_present):
         tokens = torch.stack([
             diff_h + self.relation_embedding['diff'],
             same_h + self.relation_embedding['same'],
             adjacent + self.adjacent_embedding, read], dim=1)
-        present = torch.stack([diff_mask.any(-1), same_mask.any(-1), adjacent_mask,
-                               torch.ones_like(adjacent_mask)], dim=1)
+        present = torch.stack([diff_present, same_present, adjacent_present,
+                               torch.ones_like(adjacent_present)], dim=1)
         return pack_role_tokens(tokens, present)
+
+    def _role_rows(self, query, keys, values, target_rows, diff_mask, same_mask,
+                   adjacent, adjacent_mask, read, modality):
+        diff_h, same_h, diff_present, same_present = self._pool_relation_rows(
+            query, keys, values, target_rows, diff_mask, same_mask, modality)
+        return self._pack_roles(diff_h, same_h, adjacent, read, diff_present,
+                                same_present, adjacent_mask)
 
     def _scan_rows(self, *args):
         sequence, read_position = self._role_rows(*args)
         modality = args[-1]
         return self.scan[modality](sequence, read_position)
 
-    def _finish_scan_rows(self, node, valid, rows, chunks, modality):
+    @staticmethod
+    def _scatter_context(node, rows, chunks):
         flat_node = node.reshape(-1, node.shape[-1])
         output = torch.zeros_like(flat_node)
         if chunks:
             output = output.index_copy(0, rows, torch.cat(chunks).to(output.dtype))
-        return self.update[modality](node, output.reshape_as(node), valid)
+        return output.reshape_as(node)
+
+    def _finish_scan_rows(self, node, valid, rows, chunks, modality):
+        context = self._scatter_context(node, rows, chunks)
+        return self.update[modality](node, context, valid)
 
     def _updated_adjacent_nodes(self, H, valid, queries, keys, values, diff_mask,
                                 same_mask, adjacent_mask, read, active, modality):
@@ -299,8 +313,9 @@ class AttentionGraphEncoder(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.window = cfg.local_window
-        self.layers = nn.ModuleList([AttentionGraphLayer(cfg) for _ in range(cfg.graph_layers)])
-        self.final_norm = nn.ModuleDict({m: nn.LayerNorm(cfg.hidden) for m in cfg.modalities})
+        self.layers = nn.ModuleList(AttentionGraphLayer(cfg) for _ in range(cfg.graph_layers))
+        self.final_norm = nn.ModuleDict({
+            m: nn.LayerNorm(cfg.hidden) for m in cfg.modalities})
 
     def forward(self, H, diff, same, valid, *, speakers=None, adjacency=None):
         # Build structural matrices once per encoder call, reuse across layers.

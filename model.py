@@ -1,4 +1,4 @@
-"""CRG-3: GraphSmile textf0/audio/visual -> causal Graph Mamba -> ERC."""
+"""CRG-3: causal graph encoding with Gated Role Scan for emotion recognition."""
 from math import log
 
 import torch
@@ -6,7 +6,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .attention_graph import AttentionGraphEncoder
-from .affect_fusion import ModalityAnchoredUpdate
 from .graph import MODALITY_FEATURES
 
 
@@ -49,22 +48,11 @@ class CRG3(nn.Module):
             for m in self.modalities
         })
         self.graph = AttentionGraphEncoder(cfg)
+        # Preserve the original concat classifier initialization and RNG state.
         self.classifier = nn.Sequential(nn.Dropout(cfg.dropout), nn.Linear(d, num_classes))
-        self.utterance_embeddings = None
-        self.text_anchor_fusion = None
-        self.tav_anchor_fusion = None
-        # Preserve the seeded initialization of the original concat classifier.
         with torch.random.fork_rng(devices=[]):
             self.classifier[1] = nn.Linear(len(self.modalities) * d, num_classes)
-        if cfg.fusion_mode == "text_anchor_spatial_concat":
-            with torch.random.fork_rng(devices=[]):
-                self.text_anchor_fusion = ModalityAnchoredUpdate(d, target="t")
-        elif cfg.fusion_mode == "tav_anchor_spatial_concat":
-            with torch.random.fork_rng(devices=[]):
-                self.tav_anchor_fusion = nn.ModuleDict({
-                    m: ModalityAnchoredUpdate(d, target=m, sources=None if m == "t" else ("t",))
-                    for m in self.modalities
-                })
+        self.utterance_embeddings = None
         if cfg.speaker_embeddings or cfg.speaker_position_embeddings:
             with torch.random.fork_rng(devices=[]):
                 self.utterance_embeddings = SpeakerEmbedding(
@@ -76,6 +64,9 @@ class CRG3(nn.Module):
 
     def modality_features(self, batch):
         """Return one contextual CRG output per active modality, each [B,N,H]."""
+        return self._encode(batch)
+
+    def _encode(self, batch):
         valid = batch["mask"]
         mask = valid.unsqueeze(-1)
         h = {m: self.input_proj[m](batch[MODALITY_FEATURES[m]]) for m in self.modalities}
@@ -88,25 +79,17 @@ class CRG3(nn.Module):
                                     adjacency=batch.get("adjacency"))
         return q, diagnostics
 
-    def _fuse(self, features, valid):
-        if self.tav_anchor_fusion is not None:
-            fused = torch.cat([update(features) for update in self.tav_anchor_fusion.values()], dim=-1)
-            return fused.masked_fill(~valid.unsqueeze(-1), 0)
-        if self.text_anchor_fusion is not None:
-            fused = torch.cat((self.text_anchor_fusion(features), features["a"], features["v"]), dim=-1)
-            return fused.masked_fill(~valid.unsqueeze(-1), 0)
+    def _fuse(self, features):
         return torch.cat([features[m] for m in self.modalities], dim=-1)
 
     def fused_features(self, batch):
         """Return the features read by the primary classifier."""
-        features, diagnostics = self.modality_features(batch)
-        return self._fuse(features, batch["mask"]), diagnostics
+        features, diagnostics = self._encode(batch)
+        return self._fuse(features), diagnostics
 
     def forward(self, batch, return_aux=False):
-        q, _ = self.modality_features(batch)
-        valid = batch["mask"]
-        fused = self._fuse(q, valid)
-        logits = self.classifier(fused)
+        q, _ = self._encode(batch)
+        logits = self.classifier(self._fuse(q))
         if return_aux:
             # Tensor-only dictionary is compatible with DataParallel gather.
             output = {"logits": logits}
